@@ -1,0 +1,754 @@
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { childSpawnParams, effortUndeliverable, itemModelLabel, modelLabel, resolveChildConfig, sessionChildConfig } from "./config.ts";
+import { AUDIT_PARSE_RETRIES, freezeContract, loadLedger, parseFixReport, parseVerdict, partitionGaps, planTestGate, recordOutOfScope, saveLedger } from "./contract.ts";
+import { contractPath, ledgerPath, runlockPath } from "./paths.ts";
+import { auditTask, fixTask, implementTask, readsBlock, rulesBlock } from "./prompts.ts";
+import { INTERCOM_DETACH_MARK, NetworkPause, formatAsk, runChildResilient } from "./resilience.ts";
+import { makeRpc } from "./rpc.ts";
+import type { ChildOutcome } from "./rpc.ts";
+import { acquireRunlock, artifactDir, loadProgress, loadQueue, pruneItemArtifacts, setProgress, statusOf, transientPolicy, verifyFor } from "./store.ts";
+import { AUDIT_SCHEMA, CHILD_ROLES, FIX_SCHEMA, UNPARSEABLE_GAP_ID } from "./types.ts";
+import type { ChildConfig, ChildRole, Ledger, LedgerEntry, Log, Phase, Progress } from "./types.ts";
+
+/** Rows a dry run prints before it starts counting instead of listing. */
+export const DRYRUN_ROWS = 20;
+
+export async function runVerify(
+  pi: ExtensionAPI,
+  cwd: string,
+  cmds: string[],
+  timeoutMs: number,
+  log: Log,
+): Promise<{ ok: true } | { ok: false; cmd: string; code: number; tail: string }> {
+  for (const cmd of cmds) {
+    log(`  verify: ${cmd}`);
+    const r = await pi.exec("bash", ["-lc", cmd], { cwd, timeout: timeoutMs });
+    if (r.code !== 0) {
+      const tail = `${r.stdout ?? ""}\n${r.stderr ?? ""}`.trim().split("\n").slice(-40).join("\n");
+      return { ok: false, cmd, code: r.code ?? -1, tail };
+    }
+  }
+  return { ok: true };
+}
+
+export async function runBatch(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  opts: {
+    signal?: AbortSignal;
+    only?: string;
+    dryRun?: boolean;
+    answer?: string;
+    /**
+     * True when the loop is driven by the background driver rather than by a tool call
+     * that is still holding a turn open. It changes exactly one behaviour: a pause asks
+     * nobody. A modal confirm made sense while the turn was frozen anyway; from a
+     * background driver it would steal the TUI out from under a live conversation, and
+     * the operator can already see the pause via `status` and clear it via `continue`.
+     */
+    background?: boolean;
+    /**
+     * Graceful stop, read at every phase boundary. Distinct from `signal`: a stop must
+     * not abort the child that is already running — pi-subagents cannot stop a workflow
+     * run from here, so aborting only abandons it while it keeps editing the tree. The
+     * signal is reserved for the operator's second, explicit hard stop.
+     */
+    shouldStop?: () => boolean;
+  },
+  log: Log,
+): Promise<string> {
+  const cwd = ctx.cwd;
+  const rpc = makeRpc(pi);
+  // Snapshotted here, not read per child: a batch runs for hours and the operator may switch
+  // the conversation's model mid-run. "Inherit the current session" has to mean the session
+  // that STARTED the run, or two children of one item silently disagree.
+  const session = sessionChildConfig(ctx);
+
+  if (opts.dryRun) {
+    const q = loadQueue(cwd);
+    const progress = loadProgress(cwd);
+    const todo = q.items.filter((i) => statusOf(progress, i.id) !== "committed" && (!opts.only || i.id === opts.only));
+    if (todo.length === 0) return "fr-batch: nothing to do — every queued item is committed.";
+    // Capped for the same reason `status` is: a long queue's dry run is read to check the
+    // NEXT few items and the config, never to re-read row 200.
+    const shown = todo.slice(0, DRYRUN_ROWS);
+    return [
+      `fr-batch: dry run — ${todo.length} item(s) would run, in this order${shown.length < todo.length ? ` (first ${shown.length} shown)` : ""}:`,
+      ...shown.map((i, n) => {
+        const v = verifyFor(q, i);
+        return `  ${n + 1}. ${i.id}  [${statusOf(progress, i.id)}]  ${i.plan}  verify:${v.isDefault ? "default" : `${v.cmds.length} cmd(s)`}  model:${itemModelLabel(q, i, session)}`;
+      }),
+      ...(shown.length < todo.length ? [`  ⋯ ${todo.length - shown.length} more, ending at ${todo[todo.length - 1].id}`] : []),
+      "",
+      `armed: ${q.armed} · maxFixRounds: ${q.maxFixRounds} · childTimeoutMs: ${q.childTimeoutMs}`,
+      `session inherit: ${modelLabel(session)}`,
+      "",
+      "The queue is re-read at every item boundary, so items appended while this runs are picked up.",
+    ].join("\n");
+  }
+
+  if (!loadQueue(cwd).armed) {
+    return [
+      "fr-batch: REFUSED — queue is not armed.",
+      "",
+      'Set `"armed": true` in .pi/extensions/fr-batch/queue.json when you actually want the batch',
+      "to write to this repo, and make sure no other session is working in it (the implementer edits",
+      "the tree in place; two writers corrupt each other).",
+    ].join("\n");
+  }
+
+  // Clean-tree guard, but ONLY when nothing is mid-flight. A paused or partially
+  // processed item legitimately leaves its changes in the tree — that is exactly
+  // what makes `continue` able to pick up where it stopped instead of redoing the
+  // work. Enforcing cleanliness there would make a network pause unrecoverable.
+  {
+    const q0 = loadQueue(cwd);
+    const p0 = loadProgress(cwd);
+    const next = q0.items.filter((i) => !opts.only || i.id === opts.only).find((i) => statusOf(p0, i.id) !== "committed");
+    const nextStatus = next ? statusOf(p0, next.id) : "pending";
+    if (nextStatus === "pending") {
+      const status0 = await pi.exec("git", ["status", "--porcelain"], { cwd });
+      if ((status0.stdout ?? "").trim().length > 0) {
+        return [
+          "fr-batch: REFUSED — working tree is dirty.",
+          "",
+          "Each item commits exactly its own PLAN's changes, so the tree must be clean before a",
+          "fresh item starts. Commit, stash, or discard the current changes first.",
+          "",
+          (status0.stdout ?? "").trim().split("\n").slice(0, 20).join("\n"),
+        ].join("\n");
+      }
+    } else {
+      // Resuming: the tree is expected to hold this item's in-progress work.
+    }
+  }
+
+  const lock = acquireRunlock(cwd);
+  if ("held" in lock) {
+    return `fr-batch: REFUSED — another driver holds the run lock (${lock.held}). Delete ${runlockPath(cwd)} if that process is gone.`;
+  }
+
+  const dir = artifactDir(cwd);
+  let committed = 0;
+
+  /** Non-null at a phase boundary the operator asked us not to cross. */
+  const stopNow = (where: string): string | null => {
+    if (opts.signal?.aborted) {
+      return [
+        `fr-batch: HARD STOPPED ${where}. ${committed} item(s) committed.`,
+        "",
+        "Progress is saved, so the next run resumes from the recorded phase.",
+      ].join("\n");
+    }
+    if (opts.shouldStop?.()) {
+      return [
+        `fr-batch: stopped on request ${where}. ${committed} item(s) committed.`,
+        "",
+        'Nothing was lost — progress is saved. Resume with fr_batch action "run".',
+      ].join("\n");
+    }
+    return null;
+  };
+
+  try {
+    // The outer loop re-reads queue.json every iteration. That is what makes a
+    // live append work: a new item added while an earlier one is running is
+    // simply present the next time we look.
+    for (;;) {
+      {
+        const s = stopNow("at an item boundary");
+        if (s) return s;
+      }
+
+      const q = loadQueue(cwd);
+      const policy = transientPolicy(q);
+      if (!q.armed) {
+        return `fr-batch: graceful stop — queue was disarmed mid-run. ${committed} item(s) committed. Re-arm and re-run to continue.`;
+      }
+
+      const progress = loadProgress(cwd);
+      const candidates = q.items.filter((i) => !opts.only || i.id === opts.only);
+      const item = candidates.find((i) => statusOf(progress, i.id) !== "committed");
+      if (!item) {
+        const total = candidates.length;
+        return `fr-batch: finished. ${committed} item(s) committed this run; ${total} of ${total} queued item(s) are committed.`;
+      }
+      if (statusOf(progress, item.id) === "blocked" && (progress[item.id]?.note ?? "").length > 0) {
+        return [
+          `fr-batch: STOPPED — ${item.id} is blocked from an earlier run.`,
+          "",
+          progress[item.id]?.note ?? "",
+          "",
+          `Fix it, then re-run. To redo it from scratch, run fr_batch action "reset" with only: "${item.id}".`,
+        ].join("\n");
+      }
+
+      log(`\n=== ${item.id} — ${item.plan}`);
+      // Model + effort resolved ONCE per item, so the log, the four spawns and `status` cannot
+      // disagree. An item that configures nothing lands on the session snapshot.
+      const roleCfg = (role: ChildRole): ChildConfig => resolveChildConfig(q, item, role, session);
+      const spawnFor = (role: ChildRole): { model?: string } => childSpawnParams(roleCfg(role));
+      log(`  model: ${itemModelLabel(q, item, session)}`);
+      for (const role of CHILD_ROLES) {
+        const cfg = roleCfg(role);
+        if (effortUndeliverable(cfg)) {
+          log(`  WARNING: ${role} thinking:${cfg.thinking} is NOT applied — no model resolved to carry it. Set queue.defaultModel.`);
+        }
+      }
+      const block = (why: string): string => {
+        setProgress(cwd, item.id, { status: "blocked", note: why });
+        pi.appendEntry("fr-batch", { item: item.id, status: "blocked", note: why });
+        log(`  BLOCKED: ${why}`);
+        return [
+          `fr-batch: STOPPED at ${item.id}. ${committed} item(s) committed before it.`,
+          "",
+          why,
+          "",
+          "The working tree still holds this item's changes — nothing was committed.",
+          "Later items were not started (they depend on this one landing).",
+          `Fix, then re-run. To redo from scratch: fr_batch action "reset", only: "${item.id}".`,
+        ].join("\n");
+      };
+
+      const st = statusOf(progress, item.id);
+      const fixRoundsSoFar = progress[item.id]?.fixRounds ?? 0;
+      const wasPaused = st === "paused";
+      const pausedPhase = progress[item.id]?.pausedPhase;
+      const pausedChildId = progress[item.id]?.pausedChildId;
+      const pauseKind = progress[item.id]?.pauseKind ?? "network";
+
+      // A DECISION pause cannot resume itself. Reviving the child without the answer it asked
+      // for makes it ask the same question again and burn another child, so the answer is a
+      // precondition and the question is restated here rather than being left in a file.
+      if (wasPaused && pauseKind === "decision" && !opts.answer?.trim()) {
+        return [
+          `fr-batch: WAITING FOR YOUR DECISION on ${item.id} (paused at "${pausedPhase}").`,
+          "",
+          "The child stopped because it hit a question it is not allowed to guess at. Its question:",
+          "",
+          progress[item.id]?.pendingAsk ?? "(question not recorded)",
+          "",
+          (progress[item.id]?.note ?? "").trim(),
+          "",
+          "Nothing was committed and the child's session is preserved. Decide, then deliver it:",
+          `  fr_batch action "continue", only: "${item.id}", answer: "<your decision>"`,
+          "",
+          "The answer revives THAT child with its context and its already-written files intact.",
+          `If the PLAN itself is wrong, fix the PLAN and redo the item: fr_batch action "reset", only: "${item.id}".`,
+        ]
+          .filter((l, i, a) => !(l === "" && a[i - 1] === ""))
+          .join("\n");
+      }
+      if (wasPaused) {
+        log(`  continuing from a ${pauseKind} pause at "${pausedPhase}"${pausedChildId ? ` (reviving child ${pausedChildId})` : ""}`);
+        if (pauseKind === "decision") log("  delivering the supervisor's decision to the revived child");
+      }
+
+      // Pre-flight: a PLAN with no test matrix is refused BEFORE any child is spawned. Once the
+      // contract is frozen the freeze is the authority, so this only gates a fresh item.
+      if (!existsSync(contractPath(cwd, item.id))) {
+        const gate = await planTestGate(pi, cwd, item);
+        if (!gate.ok) return block(gate.why);
+      }
+
+      /**
+       * Persist the pause and ask the human. An attended TUI session continues
+       * immediately; an unattended one degrades to a resumable pause rather than
+       * silently holding the turn open forever.
+       *
+       * Returns true when the operator said continue, so the caller retries.
+       */
+      const handlePause = async (phase: Phase, e: NetworkPause, round: number): Promise<boolean> => {
+        setProgress(cwd, item.id, {
+          status: "paused",
+          fixRounds: round,
+          pausedPhase: phase,
+          pausedChildId: e.childId,
+          pausedRound: round,
+          pauseKind: "network",
+          note: `Network unreachable during ${phase}: ${e.message}`,
+        });
+        pi.appendEntry("fr-batch", { item: item.id, status: "paused", phase, reason: e.message });
+        log(`  PAUSED: ${e.message}`);
+        if (!ctx.hasUI || opts.background) return false;
+        const ok = await ctx.ui.confirm(
+          `fr-batch paused — ${item.id}`,
+          `${e.message}\n\nPhase: ${phase}. Nothing was committed and the child's work is preserved.\nFix the connection, then choose Continue to restart the retry process.`,
+          { timeout: 10 * 60 * 1000 },
+        );
+        if (ok) log("  operator said continue — restarting the retry process");
+        return ok;
+      };
+
+      const pausedReturn = (phase: Phase): string =>
+        [
+          `fr-batch: PAUSED at ${item.id} (${phase}). ${committed} item(s) committed before it.`,
+          "",
+          progress[item.id]?.note ?? "Network unreachable after the configured retries.",
+          "",
+          "Nothing was committed. The child's session is preserved, so continuing revives it",
+          "instead of redoing the work.",
+          "",
+          `When the network is back: fr_batch action "continue"  (or /fr-batch run).`,
+        ].join("\n");
+
+      /**
+       * A hard stop landed while a child was in flight. Recorded as a resumable pause rather
+       * than a block: the operator asked for this, so it must not need a `reset` to clear.
+       *
+       * No child id is kept on purpose. The abort only ended OUR wait — the subagent run is
+       * still alive and may still be writing files, and reviving it later would put two
+       * children in the same tree. The next run re-enters this phase fresh, over whatever the
+       * abandoned child left behind.
+       *
+       * Returns null when nothing was aborted, so callers can chain it before `block`.
+       */
+      const abortStop = (phase: Phase, round: number): string | null => {
+        if (!opts.signal?.aborted) return null;
+        setProgress(cwd, item.id, {
+          status: "paused",
+          fixRounds: round,
+          pausedPhase: phase,
+          pausedRound: round,
+          pauseKind: "stopped",
+          note: `Hard-stopped by the operator during ${phase}. The child that was running was abandoned, not stopped.`,
+        });
+        pi.appendEntry("fr-batch", { item: item.id, status: "paused", phase, reason: "hard-stopped" });
+        log(`  HARD STOPPED during ${phase}`);
+        return [
+          `fr-batch: HARD STOPPED at ${item.id} (${phase}). ${committed} item(s) committed before it.`,
+          "",
+          "The child that was in flight was abandoned, not killed: it may still be running and",
+          "still writing to this tree for a while. Let it settle before starting another run.",
+          "",
+          `Nothing was committed. Resume with fr_batch action "run" — it re-enters "${phase}" over the`,
+          `files already on disk. To start the item over instead: fr_batch action "reset", only: "${item.id}".`,
+        ].join("\n");
+      };
+
+      /**
+       * A child asked for a decision, or was detached waiting for one. Pause the item and
+       * return the QUESTION — this is the notification path that was missing: previously the
+       * child was detached by pi-subagents with `status: "paused"`, the driver blocked the item
+       * with `Implementer ended with status "paused"`, and the question existed only inside the
+       * child's own report.
+       *
+       * Returns null when the child raised no decision ask, so callers can chain it.
+       */
+      const decisionStop = (phase: Phase, o: ChildOutcome, round: number): string | null => {
+        const asks = o.decisionAsks ?? [];
+        const detached = INTERCOM_DETACH_MARK.test(`${o.error ?? ""} ${o.summary ?? ""}`) || o.status === "detached";
+        if (asks.length === 0 && !detached) return null;
+        const question =
+          asks.length > 0
+            ? asks.map(formatAsk).join("\n\n")
+            : "  (the child was detached waiting for the supervisor, and its request file was already gone —\n  read its report below for the question)";
+        const reportHint = o.artifactPath ? `Child's report: ${o.artifactPath}` : "";
+        setProgress(cwd, item.id, {
+          status: "paused",
+          fixRounds: round,
+          pausedPhase: phase,
+          pausedChildId: o.asyncId,
+          pausedRound: round,
+          pauseKind: "decision",
+          pendingAsk: question,
+          note: `The ${phase} child needs a supervisor decision it is not allowed to guess at.`,
+        });
+        pi.appendEntry("fr-batch", { item: item.id, status: "paused", phase, reason: "decision-needed", question: question.slice(0, 2000) });
+        log(`  DECISION NEEDED at ${phase} — batch stopped, question surfaced`);
+        return [
+          `fr-batch: DECISION NEEDED at ${item.id} (${phase}). ${committed} item(s) committed before it.`,
+          "",
+          "The child stopped because it hit a question only you can answer. Verbatim:",
+          "",
+          question,
+          "",
+          `Child status: ${o.status}. ${o.summary ? o.summary.slice(0, 400) : ""}`,
+          reportHint,
+          "",
+          "Nothing was committed; the child's work is in the working tree and its session is preserved.",
+          "",
+          "Answer it — this revives that exact child, it does not redo the work:",
+          `  fr_batch action "continue", only: "${item.id}", answer: "<your decision>"`,
+          "",
+          `If the PLAN is what is wrong, fix the PLAN first, then: fr_batch action "reset", only: "${item.id}".`,
+        ]
+          .filter((l, i, a) => !(l === "" && a[i - 1] === ""))
+          .join("\n");
+      };
+
+      /**
+       * Resume options for a child of `phase`. Carries the operator's answer on a decision
+       * pause, so the revived child is told the decision instead of being told the network is
+       * back — which is what it would have heard before, and it would simply ask again.
+       */
+      const resumeFor = (phase: Phase): { resumeOf?: string; resumeMessage?: string } => {
+        if (!wasPaused || pausedPhase !== phase || !pausedChildId) return {};
+        if (pauseKind === "stopped") return {}; // see abortStop: that child was abandoned, not stopped
+        if (pauseKind !== "decision") return { resumeOf: pausedChildId };
+        return {
+          resumeOf: pausedChildId,
+          resumeMessage: [
+            "SUPERVISOR DECISION — this is the answer to the question you stopped on:",
+            "",
+            (opts.answer ?? "").trim(),
+            "",
+            "It is binding. Continue exactly where you left off; do not restart the task and do not",
+            "re-derive the decision. If it makes a PLAN row unsatisfiable, say so in your report.",
+          ].join("\n"),
+        };
+      };
+
+      // ---- 1. implement (skip if a previous run already got past it) ------
+      if (st === "pending" || st === "implementing" || (wasPaused && pausedPhase === "implement")) {
+        setProgress(cwd, item.id, { status: "implementing" });
+        log("  implement…");
+        let impl: ChildOutcome | undefined;
+        for (;;) {
+          try {
+            impl = await runChildResilient(
+              pi,
+              rpc,
+              { agent: "fr-implementer", ...spawnFor("implementer"), task: implementTask(item, q), context: "fresh", output: join(dir, `${item.id}-implement.md`) },
+              q.childTimeoutMs,
+              opts.signal,
+              policy,
+              log,
+              resumeFor("implement"),
+            );
+            break;
+          } catch (e) {
+            if (e instanceof NetworkPause) {
+              if (await handlePause("implement", e, fixRoundsSoFar)) continue;
+              return pausedReturn("implement");
+            }
+            return abortStop("implement", fixRoundsSoFar) ?? block(`Implementer failed to run: ${(e as Error).message}`);
+          }
+        }
+        // A decision ask outranks the status check: a child told to stop and write its question
+        // down ends "complete" with the work unfinished, and blocking on the status alone would
+        // report "changed no files" or a green item instead of the question.
+        const implDecision = decisionStop("implement", impl, fixRoundsSoFar);
+        if (implDecision) return implDecision;
+        if (impl.status !== "complete" && impl.status !== "completed" && impl.status !== "success") {
+          return block(`Implementer ended with status "${impl.status}". Summary: ${impl.summary.slice(0, 800)}`);
+        }
+        const after = await pi.exec("git", ["status", "--porcelain"], { cwd });
+        if ((after.stdout ?? "").trim().length === 0) {
+          return block("Implementer reported success but changed no files. Treating as a failure, not a no-op success.");
+        }
+      } else {
+        log(`  resuming at "${st}" (${fixRoundsSoFar} fix round(s) already spent)`);
+      }
+
+      // ---- 2. verify → 3. audit → bounded fix loop ------------------------
+      const { cmds: verifyCmds, isDefault } = verifyFor(q, item);
+      if (isDefault) log(`  (using queue.defaultVerify — ${verifyCmds.length} cmd(s))`);
+
+      let round = fixRoundsSoFar;
+      // Frozen before the first audit and reused for every round after it. This is the
+      // whole convergence mechanism: the checklist cannot grow while it is being audited.
+      const contract = await freezeContract(pi, cwd, item, log);
+      // Blocking-gap count of the previous round, for the strict-shrink check. Null on the
+      // first audit of this run.
+      let prevBlocking: number | null = null;
+      // Consecutive unparseable-verdict retries at the CURRENT round. Reset on any
+      // parseable verdict; never consumes a fix round.
+      let auditAttempt = 0;
+      for (;;) {
+        {
+          const s = stopNow(`inside ${item.id} (after ${round} fix round(s))`);
+          if (s) return s;
+        }
+
+        setProgress(cwd, item.id, { status: "verifying", fixRounds: round });
+        log(`  verify (after ${round} fix round(s))…`);
+        const v = await runVerify(pi, cwd, verifyCmds, q.verifyTimeoutMs, log);
+        if (!v.ok) {
+          if (round >= q.maxFixRounds) {
+            return block(`Verify failed after ${round} fix round(s): \`${v.cmd}\` exited ${v.code}.\n\n${v.tail}`);
+          }
+          round += 1;
+          setProgress(cwd, item.id, { status: "fixing", fixRounds: round });
+          log(`  verify RED — fix round ${round}/${q.maxFixRounds}`);
+          const fixVerifyTask = `The build/test gate for this FR PLAN is RED. Fix it.
+
+Read:
+${readsBlock(item)}
+
+Failing command: \`${v.cmd}\` (exit ${v.code})
+
+Tail of its output:
+\`\`\`
+${v.tail}
+\`\`\`
+
+Fix the cause, not the symptom: do not delete or weaken a test to make the command pass. If the
+test is right and the implementation is wrong, fix the implementation. Do NOT commit.${rulesBlock(q)}`;
+          let fixVerify: ChildOutcome | undefined;
+          for (;;) {
+            try {
+              fixVerify = await runChildResilient(
+                pi,
+                rpc,
+                { agent: "fr-gap-fixer", ...spawnFor("fixer"), context: "fresh", output: join(dir, `${item.id}-fix-verify-${round}.md`), task: fixVerifyTask },
+                q.childTimeoutMs,
+                opts.signal,
+                policy,
+                log,
+                resumeFor("fix-verify"),
+              );
+              break;
+            } catch (e) {
+              if (e instanceof NetworkPause) {
+                if (await handlePause("fix-verify", e, round)) continue;
+                return pausedReturn("fix-verify");
+              }
+              return abortStop("fix-verify", round) ?? block(`Fixer failed to run after a red verify: ${(e as Error).message}`);
+            }
+          }
+          const fixVerifyDecision = decisionStop("fix-verify", fixVerify, round);
+          if (fixVerifyDecision) return fixVerifyDecision;
+          continue;
+        }
+        log("  verify GREEN");
+
+        setProgress(cwd, item.id, { status: "auditing", fixRounds: round });
+        log("  audit…");
+        const verdictPath = join(dir, `${item.id}-audit-${round}.json`);
+        let audit: ChildOutcome | undefined;
+        for (;;) {
+          try {
+            audit = await runChildResilient(
+              pi,
+              rpc,
+              {
+                agent: "fr-test-auditor",
+                ...spawnFor("auditor"),
+                context: "fresh",
+                task: auditTask(item, contract, loadLedger(cwd, item.id)),
+                outputSchema: AUDIT_SCHEMA,
+                output: verdictPath,
+                outputMode: "file-only",
+              },
+              q.childTimeoutMs,
+              opts.signal,
+              policy,
+              log,
+              resumeFor("audit"),
+            );
+            break;
+          } catch (e) {
+            if (e instanceof NetworkPause) {
+              if (await handlePause("audit", e, round)) continue;
+              return pausedReturn("audit");
+            }
+            return abortStop("audit", round) ?? block(`Auditor failed to run: ${(e as Error).message}`);
+          }
+        }
+
+        const auditDecision = decisionStop("audit", audit, round);
+        if (auditDecision) return auditDecision;
+
+        // PREFER THE STRUCTURED OUTPUT. The auditor runs with an outputSchema, so
+        // its schema-valid verdict arrives on the completion event; the artifact
+        // FILE is where its prose narration lands. Reading the file first is why
+        // this driver kept synthesising AUDIT-UNPARSEABLE and throwing away real
+        // gaps. File and summary remain fallbacks for an auditor without a schema.
+        const structured = audit.structuredOutput;
+        const rawPath = audit.artifactPath && existsSync(audit.artifactPath) ? audit.artifactPath : verdictPath;
+        const raw = structured !== undefined && structured !== null
+          ? JSON.stringify(structured)
+          : existsSync(rawPath)
+            ? readFileSync(rawPath, "utf8")
+            : audit.summary;
+        const verdict = parseVerdict(raw);
+
+        // AN UNPARSEABLE VERDICT IS A TRANSPORT FAILURE, NOT A COVERAGE GAP, so it
+        // must never reach the ledger. Letting it in deadlocks the item: no fixer
+        // can close "the auditor did not return a schema-valid verdict" — there is
+        // no code seam to name and no edit that could go RED — so the convergence
+        // check sees the same count every round and blocks forever. Both observed
+        // causes were pure transport: once the child's prose landed in the output
+        // slot, once a Bedrock outage streamed raw session JSONL where the schema
+        // object belonged. In the second case a schema-valid audit had ALREADY
+        // walked all 29 contract rows and returned `complete` with no gaps, and the
+        // driver threw that away and blocked. Retry the audit instead; only give up
+        // after `auditRetries`, and then say it is infrastructure rather than
+        // filing a gap the fixer is expected to close.
+        const onlyUnparseable =
+          verdict.gaps.length === 1 && (verdict.gaps[0].id ?? "").trim() === UNPARSEABLE_GAP_ID;
+        if (onlyUnparseable) {
+          if (auditAttempt < AUDIT_PARSE_RETRIES) {
+            auditAttempt++;
+            log(`  audit verdict unparseable (transport) — retrying audit ${auditAttempt}/${AUDIT_PARSE_RETRIES}`);
+            continue;
+          }
+          return block(
+            `Auditor returned an unparseable verdict ${AUDIT_PARSE_RETRIES + 1} time(s). This is the auditor's ` +
+              `TRANSPORT, not a test gap: no gap was filed and the ledger is untouched. Raw head: ${raw.slice(0, 300)}`,
+          );
+        }
+        auditAttempt = 0;
+
+        // Scope gate. An adversarial auditor asked to find gaps will always find one more;
+        // only findings that name a row of the FROZEN contract may gate this item.
+        const { blocking, outOfScope } = partitionGaps(verdict.gaps, contract);
+        if (outOfScope.length > 0 || verdict.notes?.trim()) {
+          recordOutOfScope(cwd, item, round, outOfScope, verdict.notes);
+          if (outOfScope.length > 0) {
+            log(`  ${outOfScope.length} finding(s) fell outside the frozen contract → non-blocking, recorded in ${item.id}.out-of-scope.md`);
+          }
+        }
+
+        // Ledger: what was raised when, and what the previous round's fixer settled.
+        const ledger = loadLedger(cwd, item.id);
+        const nowIds = blocking.map((g) => (g.id ?? "").trim());
+        const repeats = nowIds.filter((id) => (ledger[id]?.raisedRounds ?? []).length > 0);
+        for (const [id, e] of Object.entries(ledger)) {
+          if (e.state === "open" && !nowIds.includes(id)) e.state = "closed";
+        }
+        for (const g of blocking) {
+          const id = (g.id ?? "").trim();
+          const e: LedgerEntry = ledger[id] ?? { kind: g.kind, what: g.what, raisedRounds: [], state: "open" };
+          e.kind = g.kind;
+          e.what = g.what;
+          if (!e.raisedRounds.includes(round)) e.raisedRounds.push(round);
+          e.state = "open";
+          ledger[id] = e;
+        }
+        saveLedger(cwd, item.id, ledger);
+
+        if (blocking.length === 0) {
+          log(verdict.gaps.length > 0 ? `  audit COMPLETE (all ${verdict.gaps.length} finding(s) were out of contract)` : "  audit COMPLETE");
+          break;
+        }
+        log(`  audit found ${blocking.length} in-contract gap(s)`);
+
+        // Non-convergence guards. Both are "stop and show a human", never "spend another
+        // round": a loop that re-litigates a settled row or grows its gap set does not have
+        // a fixed point, and burning maxFixRounds only hides that as a timeout.
+        if (repeats.length > 0) {
+          const detail = repeats
+            .map((id) => `  - ${id} (raised in round(s) ${(ledger[id]?.raisedRounds ?? []).join(", ")}${ledger[id]?.reason ? `; fixer had rejected it: ${ledger[id]?.reason}` : ""})`)
+            .join("\n");
+          return block(
+            [
+              `Audit is not converging: ${repeats.length} gap(s) already adjudicated in an earlier round are being raised again.`,
+              "",
+              detail,
+              "",
+              repeats.includes(UNPARSEABLE_GAP_ID)
+                ? "AUDIT-UNPARSEABLE twice means the auditor agent or its outputSchema is misconfigured, not that the tests are thin."
+                : "Either the fixer's closing test really is vacuous (then fix it by hand) or the auditor is re-litigating a settled row (then record the rejection in the ledger).",
+              "",
+              `Verdict: ${rawPath}`,
+              `Ledger:  ${ledgerPath(cwd, item.id)}`,
+            ].join("\n"),
+          );
+        }
+        if (prevBlocking !== null && blocking.length >= prevBlocking) {
+          return block(
+            [
+              `Audit is not converging: this round reports ${blocking.length} in-contract gap(s), the previous round reported ${prevBlocking} — the gap set is not shrinking.`,
+              "",
+              blocking.map((g) => `  - [${g.id} · ${g.kind}] ${g.what}`).join("\n"),
+              "",
+              "A fix round that does not reduce the gap count is expanding scope, not closing it.",
+              "",
+              `Verdict: ${rawPath}`,
+              `Ledger:  ${ledgerPath(cwd, item.id)}`,
+            ].join("\n"),
+          );
+        }
+        if (round >= q.maxFixRounds) {
+          const list = blocking.map((g) => `  - [${g.id} · ${g.kind}] ${g.what}`).join("\n");
+          return block(`Audit still reports ${blocking.length} in-contract gap(s) after ${q.maxFixRounds} fix round(s):\n${list}\n\nFull verdict: ${rawPath}`);
+        }
+        prevBlocking = blocking.length;
+
+        round += 1;
+        setProgress(cwd, item.id, { status: "fixing", fixRounds: round });
+        log(`  fix round ${round}/${q.maxFixRounds}`);
+        const fixAuditTask = fixTask(item, blocking, verdict.notes, q);
+        const fixReportPath = join(dir, `${item.id}-fix-audit-${round}.json`);
+        let fix: ChildOutcome | undefined;
+        for (;;) {
+          try {
+            fix = await runChildResilient(
+              pi,
+              rpc,
+              {
+                agent: "fr-gap-fixer",
+                ...spawnFor("fixer"),
+                task: fixAuditTask,
+                context: "fresh",
+                outputSchema: FIX_SCHEMA,
+                output: fixReportPath,
+                outputMode: "file-only",
+              },
+              q.childTimeoutMs,
+              opts.signal,
+              policy,
+              log,
+              resumeFor("fix-audit"),
+            );
+            break;
+          } catch (e) {
+            if (e instanceof NetworkPause) {
+              if (await handlePause("fix-audit", e, round)) continue;
+              return pausedReturn("fix-audit");
+            }
+            return abortStop("fix-audit", round) ?? block(`Fixer failed to run after an audit gap report: ${(e as Error).message}`);
+          }
+        }
+
+        const fixAuditDecision = decisionStop("fix-audit", fix, round);
+        if (fixAuditDecision) return fixAuditDecision;
+
+        // Ingest the fixer's rejections. This is the only way an invalid gap dies: without it
+        // the next audit re-raises it, and a re-raise now stops the batch.
+        {
+          const p = fix.artifactPath && existsSync(fix.artifactPath) ? fix.artifactPath : fixReportPath;
+          const report = existsSync(p) ? parseFixReport(readFileSync(p, "utf8")) : null;
+          if (!report) {
+            log("  (fixer returned no parseable report — no rejection recorded)");
+          } else if (report.rejected.length > 0) {
+            const l = loadLedger(cwd, item.id);
+            for (const r of report.rejected) {
+              const id = r.id.trim();
+              if (!l[id]) continue; // only gaps we actually raised can be rejected
+              l[id].state = "rejected";
+              l[id].reason = r.why;
+            }
+            saveLedger(cwd, item.id, l);
+            log(`  fixer rejected ${report.rejected.length} gap(s) as invalid → recorded in the ledger`);
+          }
+        }
+      }
+
+      // ---- 4. commit -----------------------------------------------------
+      log("  commit…");
+      const add = await pi.exec("git", ["add", "-A"], { cwd });
+      if (add.code !== 0) return block(`git add failed: ${add.stderr}`);
+      const msg = item.commitMsg ?? `feat: implement ${item.plan}`;
+      const commit = await pi.exec("git", ["commit", "-m", msg], { cwd });
+      if (commit.code !== 0) return block(`git commit failed: ${commit.stderr || commit.stdout}`);
+      const sha = (await pi.exec("git", ["rev-parse", "--short", "HEAD"], { cwd })).stdout?.trim() ?? "?";
+
+      setProgress(cwd, item.id, { status: "committed", fixRounds: round, sha, note: "" });
+      pi.appendEntry("fr-batch", { item: item.id, status: "committed", sha, fixRounds: round });
+      log(`  COMMITTED ${sha} (${round} fix round(s))`);
+      pruneItemArtifacts(cwd, item.id, log);
+      committed += 1;
+    }
+  } finally {
+    lock.release();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// background driver — the run outlives the turn that started it
+// ---------------------------------------------------------------------------

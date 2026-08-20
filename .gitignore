@@ -1,0 +1,7 @@
+# Nothing generated lives here: no build step, no bundler, no node_modules — tsconfig.json
+# maps the pi packages out of the global install, and pi loads the .ts files directly.
+# So this file exists only to keep editor/OS droppings and a stray local install out.
+node_modules/
+*.log
+*.bak
+.DS_Store
