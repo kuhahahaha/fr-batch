@@ -2,7 +2,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSyn
 import { dirname, join } from "node:path";
 import { assertChildConfig, assertRoleConfigs } from "./config.ts";
 import { baseDir, historyPath, progressPath, queuePath, runlockPath, writeAtomic } from "./paths.ts";
-import { TRANSIENT_DEFAULTS } from "./types.ts";
+import { TRANSIENT_DEFAULTS, TRANSIENT_QUOTA_DEFAULTS } from "./types.ts";
 import type { HistoryEntry, ItemStatus, Log, Progress, ProgressEntry, Queue, QueueItem, TransientPolicy } from "./types.ts";
 
 export const STALE_RUNLOCK_MS = 15 * 60 * 1000;
@@ -34,6 +34,15 @@ export function loadQueue(cwd: string): Queue {
 /** Merge the queue's transient block over the defaults so an older queue.json still loads. */
 export function transientPolicy(q: Queue): TransientPolicy {
   return { ...TRANSIENT_DEFAULTS, ...(q.transient ?? {}) };
+}
+
+/**
+ * The QUOTA policy. `transientQuota` wins, then the quota defaults — deliberately NOT layered
+ * over `transient`, because a repo that tightened `transient` for fast network failure would
+ * otherwise silently tighten the quota budget too, which is the coupling this split removes.
+ */
+export function transientQuotaPolicy(q: Queue): TransientPolicy {
+  return { ...TRANSIENT_QUOTA_DEFAULTS, ...(q.transientQuota ?? {}) };
 }
 
 // ---------------------------------------------------------------------------

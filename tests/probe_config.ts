@@ -320,5 +320,59 @@ function makeFake(repo: string) {
   ok("...and so does the implementer", spawns[0]?.model === "sess/sessmodel:minimal", JSON.stringify(spawns[0]));
 }
 
+// ---------------------------------------------------------------------------
+// QUOTA RETRY — a 429 gets its OWN budget, counted apart from network faults
+//
+// Why this probe exists: a `429 insufficient_quota` was classified transient (correct) and then
+// spent the SHARED 6-attempt / 300s-cap budget in ~13 minutes, after which the batch PAUSED and
+// waited for a human to type "continue" — for a condition that fixes itself when the provider's
+// window rolls over. The verdict was right and the BUDGET was wrong.
+// ---------------------------------------------------------------------------
+{
+  const { isQuotaReason, backoffDelay } = await import("../resilience.ts");
+  const { transientPolicy, transientQuotaPolicy } = await import("../store.ts");
+
+  // The classifier reads the reason string transientHit already returned — one signature list.
+  for (const yes of ["429", "insufficient_quota", "rate limit", "Too Many Requests", "quota"])
+    ok(`isQuotaReason should accept ${JSON.stringify(yes)}`, isQuotaReason(yes));
+  // A transport fault must NOT be reclassified: it would then wait 30 min for a 2s blip.
+  for (const no of ["502", "503", "aborted", "connection reset", "stream interrupted", null])
+    ok(`isQuotaReason should reject ${JSON.stringify(no)}`, !isQuotaReason(no as string));
+
+  const q = { armed: true, items: [] } as unknown as Parameters<typeof transientPolicy>[0];
+  const net = transientPolicy(q);
+  const quo = transientQuotaPolicy(q);
+
+  // The point of the split: the quota horizon must be ORDERS longer, not marginally longer.
+  ok("quota budget should allow far more attempts", quo.maxRetries > net.maxRetries * 5);
+  ok("quota backoff should cap far higher", quo.maxDelayMs >= net.maxDelayMs * 5);
+  // ~27h of horizon: the cap is reached early and every later wait is the cap.
+  const horizon = Array.from({ length: quo.maxRetries }, (_, i) =>
+    Math.min(quo.maxDelayMs, quo.baseDelayMs * 2 ** i),
+  ).reduce((a, b) => a + b, 0);
+  ok(`quota horizon should exceed 20h, got ${Math.round(horizon / 3600000)}h`, horizon > 20 * 3600 * 1000);
+
+  // A repo tightening `transient` for fast network failure must NOT tighten the quota budget —
+  // that coupling is exactly what this split removes, so it is asserted rather than assumed.
+  const tightened = { armed: true, items: [], transient: { maxRetries: 0, maxDelayMs: 1 } } as unknown as Parameters<typeof transientPolicy>[0];
+  ok("transient override should apply", transientPolicy(tightened).maxRetries === 0);
+  ok(
+    "a transient override must NOT leak into the quota policy",
+    transientQuotaPolicy(tightened).maxRetries === quo.maxRetries,
+  );
+  // And an explicit quota override still wins.
+  const qover = { armed: true, items: [], transientQuota: { maxRetries: 3 } } as unknown as Parameters<typeof transientPolicy>[0];
+  ok("transientQuota override should apply", transientQuotaPolicy(qover).maxRetries === 3);
+
+  // backoffDelay is jittered around the target, so bound it rather than equate it.
+  const d = backoffDelay(0, quo);
+  ok(`jittered base delay out of range: ${d}`, d >= quo.baseDelayMs * 0.5 && d <= quo.baseDelayMs * 1.5);
+  const dcap = backoffDelay(40, quo);
+  ok(`capped delay should respect maxDelayMs, got ${dcap}`, dcap <= quo.maxDelayMs * 1.5);
+}
+
+
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
+
 process.exit(fails === 0 ? 0 : 1);

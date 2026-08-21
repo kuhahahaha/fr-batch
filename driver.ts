@@ -8,7 +8,7 @@ import { auditTask, fixTask, implementTask, readsBlock, rulesBlock } from "./pro
 import { INTERCOM_DETACH_MARK, NetworkPause, formatAsk, runChildResilient } from "./resilience.ts";
 import { makeRpc } from "./rpc.ts";
 import type { ChildOutcome } from "./rpc.ts";
-import { acquireRunlock, artifactDir, loadProgress, loadQueue, pruneItemArtifacts, setProgress, statusOf, transientPolicy, verifyFor } from "./store.ts";
+import { acquireRunlock, artifactDir, loadProgress, loadQueue, pruneItemArtifacts, setProgress, statusOf, transientPolicy, transientQuotaPolicy, verifyFor } from "./store.ts";
 import { AUDIT_SCHEMA, CHILD_ROLES, FIX_SCHEMA, UNPARSEABLE_GAP_ID } from "./types.ts";
 import type { ChildConfig, ChildRole, Ledger, LedgerEntry, Log, Phase, Progress } from "./types.ts";
 
@@ -164,6 +164,10 @@ export async function runBatch(
 
       const q = loadQueue(cwd);
       const policy = transientPolicy(q);
+      // A quota/rate-limit refusal gets its OWN budget: it recovers when a window rolls over,
+      // not in the seconds a transport fault takes, and sharing one budget paused the batch
+      // for a condition that fixes itself.
+      const quotaPolicy = transientQuotaPolicy(q);
       if (!q.armed) {
         return `fr-batch: graceful stop — queue was disarmed mid-run. ${committed} item(s) committed. Re-arm and re-run to continue.`;
       }
@@ -416,7 +420,7 @@ export async function runBatch(
               opts.signal,
               policy,
               log,
-              resumeFor("implement"),
+              { ...resumeFor("implement"), quotaPolicy },
             );
             break;
           } catch (e) {
@@ -498,7 +502,7 @@ test is right and the implementation is wrong, fix the implementation. Do NOT co
                 opts.signal,
                 policy,
                 log,
-                resumeFor("fix-verify"),
+                { ...resumeFor("fix-verify"), quotaPolicy },
               );
               break;
             } catch (e) {
@@ -537,7 +541,7 @@ test is right and the implementation is wrong, fix the implementation. Do NOT co
               opts.signal,
               policy,
               log,
-              resumeFor("audit"),
+              { ...resumeFor("audit"), quotaPolicy },
             );
             break;
           } catch (e) {
@@ -693,7 +697,7 @@ test is right and the implementation is wrong, fix the implementation. Do NOT co
               opts.signal,
               policy,
               log,
-              resumeFor("fix-audit"),
+              { ...resumeFor("fix-audit"), quotaPolicy },
             );
             break;
           } catch (e) {

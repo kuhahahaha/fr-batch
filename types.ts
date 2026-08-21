@@ -81,6 +81,14 @@ export interface Queue {
    */
   repoRules?: string;
   transient?: Partial<TransientPolicy>;
+  /**
+   * Retry policy for a QUOTA/RATE-LIMIT refusal, which is a different animal from a network
+   * blip and needs its own budget. A blip recovers in seconds; an `insufficient_quota` 429 is a
+   * SPEND CAP and recovers when a window rolls over or a human raises a limit — hours, not
+   * minutes. Sharing one budget meant a 429 exhausted 6 attempts inside ~13 minutes and paused
+   * the batch, which is what this split exists to stop.
+   */
+  transientQuota?: Partial<TransientPolicy>;
   /** Batch-wide model for every child that does not override it. Omit to inherit the session's. */
   defaultModel?: string;
   /** Batch-wide reasoning effort. Omit to inherit the session's. */
@@ -94,6 +102,24 @@ export const TRANSIENT_DEFAULTS: TransientPolicy = {
   maxRetries: 6,
   baseDelayMs: 15_000,
   maxDelayMs: 300_000,
+  probeUrl: "",
+  resumeOnRetry: true,
+};
+
+/**
+ * QUOTA/RATE-LIMIT defaults — same mechanism, a budget sized for the actual recovery time.
+ *
+ * 30s base, doubling, capped at 30 min, 60 attempts: the cap is reached at attempt 6 and every
+ * later wait is ~30 min, so the total horizon is roughly 27 hours. That is deliberately longer
+ * than any provider's rolling window, because the alternative — pausing the batch — costs a
+ * human round-trip to type "continue", and an unattended batch then sits idle until someone
+ * notices. Retrying is cheap: `resumeOnRetry` revives the SAME child with its context and its
+ * already-written files intact, so a wait costs wall-clock and nothing else.
+ */
+export const TRANSIENT_QUOTA_DEFAULTS: TransientPolicy = {
+  maxRetries: 60,
+  baseDelayMs: 30_000,
+  maxDelayMs: 1_800_000,
   probeUrl: "",
   resumeOnRetry: true,
 };

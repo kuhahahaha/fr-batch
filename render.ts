@@ -4,7 +4,7 @@ import { itemModelLabel, modelLabel } from "./config.ts";
 import { loadLedger } from "./contract.ts";
 import { contractPath, historyPath, itemStateFiles, outOfScopePath, progressPath, queuePath, runlockPath } from "./paths.ts";
 import { describeLive, drivers, elapsedLabel, finishedRuns } from "./state.ts";
-import { countHistory, loadHistory, loadProgress, loadQueue, statusOf, transientPolicy, verifyFor } from "./store.ts";
+import { countHistory, loadHistory, loadProgress, loadQueue, statusOf, transientPolicy, transientQuotaPolicy, verifyFor } from "./store.ts";
 import type { ChildConfig, ItemStatus, Progress, Queue, QueueItem } from "./types.ts";
 
 /** Default number of archived items `history` lists, newest first. */
@@ -194,6 +194,7 @@ export function renderStatus(cwd: string, session: ChildConfig = {}, view: Statu
   const orphans = Object.keys(progress).filter((id) => !q.items.some((i) => i.id === id));
   const archived = countHistory(cwd);
   const pol = transientPolicy(q);
+  const qpol = transientQuotaPolicy(q);
   return [
     `fr-batch — armed: ${q.armed} · maxFixRounds: ${q.maxFixRounds} · ${done}/${q.items.length} committed${archived ? ` · ${archived} archived` : ""}`,
     `model: ${baselineModel}${session.model ? ` · session inherit: ${modelLabel(session)}` : " · session model unknown"}`,
@@ -240,6 +241,10 @@ export function renderStatus(cwd: string, session: ChildConfig = {}, view: Statu
       : []),
     "audit: frozen contract per item, out-of-contract findings non-blocking, gap set must shrink each round",
     `network retry: ${pol.maxRetries} attempt(s), ${Math.round(pol.baseDelayMs / 1000)}s→${Math.round(pol.maxDelayMs / 1000)}s backoff${pol.probeUrl ? `, probe ${pol.probeUrl}` : ", no probe"}${pol.resumeOnRetry ? ", resume-on-retry" : ", respawn-on-retry"}`,
+    // Rendered as its OWN line, not folded into the one above: the two budgets are counted
+    // separately, so a reader who sees only "6 attempts" would draw the wrong conclusion
+    // about what happens on a 429.
+    `quota retry:   ${qpol.maxRetries} attempt(s), ${Math.round(qpol.baseDelayMs / 1000)}s→${Math.round(qpol.maxDelayMs / 1000)}s backoff (429 / insufficient_quota / rate limit — counted apart from network)`,
     `queue (yours):     ${queuePath(cwd)}`,
     `progress (driver): ${progressPath(cwd)}`,
   ].join("\n");

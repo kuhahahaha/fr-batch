@@ -121,6 +121,34 @@ export function transientHit(text: string | undefined): string | null {
   return null;
 }
 
+/**
+ * QUOTA / RATE-LIMIT signatures — a SUBSET of the transient ones, split out because they recover
+ * on a different timescale and so need a different budget, not a different verdict.
+ *
+ * A 502 clears in seconds. An `insufficient_quota` 429 is a SPEND CAP: it clears when a rolling
+ * window rolls over or when a human raises a limit. Measured here: the batch's `implementer` role
+ * hit `429 insufficient_quota` and the shared 6-attempt / 300s-cap budget was spent in ~13
+ * minutes, after which the batch PAUSED and waited for a human to type "continue" — for a
+ * condition that fixes itself. That is the failure this split removes.
+ *
+ * Matching is on the reason string `transientHit` already returned, so there is ONE signature
+ * list and this only re-reads its verdict. A second independent scan of the raw text would be a
+ * second classifier, and two classifiers drift.
+ */
+const QUOTA_SIGNATURES: RegExp[] = [
+  /\b429\b/,
+  /insufficient[_ ]quota/i,
+  /\bquota\b/i,
+  /rate ?limit/i,
+  /too many requests/i,
+];
+
+/** True when a transient reason is a quota/rate-limit refusal rather than a transport fault. */
+export function isQuotaReason(reason: string | null | undefined): boolean {
+  if (!reason) return false;
+  return QUOTA_SIGNATURES.some((re) => re.test(reason));
+}
+
 /** Returns the matched signature when the outcome looks like an outage, else null. */
 export function transientReason(o: ChildOutcome): string | null {
   // A child the driver itself stopped/interrupted, or that blew its wall clock, is
@@ -349,10 +377,18 @@ export async function runChildResilient(
   signal: AbortSignal | undefined,
   policy: TransientPolicy,
   log: Log,
-  opts: { resumeOf?: string; resumeMessage?: string } = {},
+  opts: { resumeOf?: string; resumeMessage?: string; quotaPolicy?: TransientPolicy } = {},
 ): Promise<ChildOutcome> {
   let lastChildId: string | undefined = opts.resumeOf;
   let lastReason = "unknown";
+  // TWO BUDGETS, COUNTED SEPARATELY. A quota refusal recovers on a different timescale from a
+  // transport fault, so they must not spend each other's attempts: three network blips during a
+  // long quota wait would otherwise end the item, and a quota wait would otherwise consume the
+  // budget that exists to ride out a blip. `attempt` stays the loop counter (it drives resume vs
+  // fresh spawn); these two only decide when to give up and how long to sleep.
+  const quotaPolicy = opts.quotaPolicy ?? policy;
+  let netTries = 0;
+  let quotaTries = 0;
 
   for (let attempt = 0; ; attempt++) {
     let liveId: string | undefined;
@@ -407,11 +443,18 @@ export async function runChildResilient(
     if (!reason) throw thrown; // a real error: wall clock, abort, or an unrecognised fault
     lastReason = reason;
 
-    if (attempt >= policy.maxRetries) throw new NetworkPause(lastChildId, lastReason, attempt + 1);
+    // Pick the budget that matches what actually failed, and charge only that one.
+    const quota = isQuotaReason(reason);
+    const p = quota ? quotaPolicy : policy;
+    const tries = quota ? quotaTries++ : netTries++;
 
-    const delay = backoffDelay(attempt, policy);
-    log(`    transient failure (${reason}) — retry ${attempt + 1}/${policy.maxRetries} in ${Math.round(delay / 1000)}s`);
-    await waitForRecovery(delay, policy, signal, log);
+    if (tries >= p.maxRetries) throw new NetworkPause(lastChildId, lastReason, tries + 1);
+
+    const delay = backoffDelay(tries, p);
+    log(
+      `    ${quota ? "quota" : "transient"} failure (${reason}) — retry ${tries + 1}/${p.maxRetries} in ${Math.round(delay / 1000)}s`,
+    );
+    await waitForRecovery(delay, p, signal, log);
   }
 }
 
