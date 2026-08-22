@@ -1,7 +1,7 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { itemModelLabel, modelLabel } from "./config.ts";
-import { loadLedger } from "./contract.ts";
+import { extractTestsSection, loadLedger } from "./contract.ts";
 import { contractPath, historyPath, itemStateFiles, outOfScopePath, progressPath, queuePath, runlockPath } from "./paths.ts";
 import { describeLive, drivers, elapsedLabel, finishedRuns } from "./state.ts";
 import { countHistory, loadHistory, loadProgress, loadQueue, statusOf, transientPolicy, transientQuotaPolicy, verifyFor } from "./store.ts";
@@ -88,7 +88,7 @@ export function itemChips(q: Queue, item: QueueItem, progress: Progress, session
     s === "paused" ? `pause:${p?.pauseKind ?? "network"}` : "",
     verifyFor(q, item).isDefault ? "verify:default" : "",
     itemModelLabel(q, item, session) !== baselineModel ? `model:${itemModelLabel(q, item, session)}` : "",
-    existsSync(contractPath(cwd, item.id)) ? "contract:frozen" : "",
+    contractDriftTag(cwd, item),
     existsSync(outOfScopePath(cwd, item.id)) ? "out-of-scope:yes" : "",
   ]
     .filter(Boolean)
@@ -135,6 +135,47 @@ export function renderItemDetail(cwd: string, id: string, session: ChildConfig):
  * a caller that has no ExtensionContext (the guard tests), where every row then reads
  * "inherit" — which is exactly what an unresolvable session means.
  */
+
+/**
+ * `contract:frozen`, or `contract:DRIFTED` when the on-disk PLAN's `## Tests` section no longer
+ * matches the frozen one.
+ *
+ * WHY THIS WARNS RATHER THAN BLOCKS. The frozen copy governs grading, and that is correct — an
+ * implementer must not widen its own contract mid-item. But NOTHING told the supervisor when the
+ * source PLAN was edited underneath a live item, and the two copies then answer "what does this row
+ * require?" differently: the auditor grades the frozen text while a fixer reading the PLAN sees the
+ * edited one. Measured cost: on `delete-cpu-ops` the §0 was rewritten while `## Tests` was left
+ * stale, and TWO consecutive audit rounds reached the same unanswerable question before anyone
+ * noticed the contract and its premise had separated. Two copies of a decision is how the copies
+ * drift; this makes the separation visible at the one moment it matters.
+ */
+function contractDriftTag(cwd: string, item: QueueItem): string {
+  const p = contractPath(cwd, item.id);
+  if (!existsSync(p)) return "";
+  let frozen = "";
+  try {
+    frozen = readFileSync(p, "utf8");
+  } catch {
+    return "contract:frozen";
+  }
+  const plan = join(cwd, item.plan);
+  if (!existsSync(plan)) return "contract:frozen";
+  let live = "";
+  try {
+    live = readFileSync(plan, "utf8");
+  } catch {
+    return "contract:frozen";
+  }
+  const liveTests = extractTestsSection(live);
+  if (!liveTests) return "contract:frozen";
+  // The frozen file is the header comment plus the section; compare only the section's own text,
+  // normalised for trailing whitespace so a reflow is not reported as a semantic change.
+  const norm = (t: string) =>
+    t.split("\n").map((l) => l.replace(/\s+$/, "")).join("\n").trim();
+  const frozenBody = norm(frozen.replace(/^<!--[\s\S]*?-->\s*/, ""));
+  return norm(liveTests) === frozenBody ? "contract:frozen" : "contract:DRIFTED";
+}
+
 export function renderStatus(cwd: string, session: ChildConfig = {}, view: StatusView = {}): string {
   if (view.only) return renderItemDetail(cwd, view.only, session);
   const q = loadQueue(cwd);
