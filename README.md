@@ -16,6 +16,43 @@ implement → verify → adversarial audit → [fix → verify → audit]×N →
 Nothing here is a judgment call the batch can fudge: the gate is an exit code plus
 a JSON field, and the commit only happens when both pass.
 
+## Install
+
+```bash
+pi install npm:pi-subagents                      # required — see below
+pi install git:github.com/AllenDang/fr-batch
+```
+
+Restart pi, or `/reload`.
+
+**pi-subagents is a hard dependency, not an optional integration.** Every child is spawned
+through its in-process RPC (`subagents:rpc:v1:request`) and there is no fallback path, so
+without it `action: "run"` fails on the 30 s RPC timeout with `is pi-subagents loaded?`.
+Read [Disk footprint](#disk-footprint) before the first run — its default `artifactDir`
+writes to a directory nothing age-cleans.
+
+Then, in each repo the batch should work on:
+
+```jsonc
+// <repo>/.pi/fr-batch/queue.json   — yours; the driver only reads it
+{
+  "armed": false,                  // run refuses while false. Arm it deliberately.
+  "maxFixRounds": 4,
+  "childTimeoutMs": 5400000,
+  "verifyTimeoutMs": 1800000,
+  "defaultVerify": ["scons", "scons test && bin/ange_test"],   // this repo's own gate
+  "items": [
+    { "id": "L0-base", "plan": "docs/FR_base_PLAN.md" }
+  ]
+}
+```
+
+`defaultVerify` and `items` are the only fields `loadQueue` validates — but do not trim the
+rest: `maxFixRounds`, `childTimeoutMs` and `verifyTimeoutMs` are read with no default, so
+omitting one leaves the fix loop or a timeout unbounded. Take the gate from the project's own
+context file rather than inventing one. `/fr-batch` then renders the queue and
+`action: "add"` appends to it, so this file is written by hand exactly once.
+
 ## Files and who owns them
 
 All per-project state lives under `<repo>/.pi/fr-batch/`:
@@ -466,10 +503,13 @@ Three invariants hold the split together, all pinned by `tests/probe_modules.ts`
 ## After editing
 
 ```bash
-cd ~/.pi/agent/extensions/fr-batch
-/opt/homebrew/lib/node_modules/typescript/bin/tsc -p tsconfig.json   # typecheck (include: ["*.ts"])
-node tests/run.mjs                                                  # guard tests
+node tests/typecheck.mjs   # link .types/ + typecheck (include: ["*.ts"])
+node tests/run.mjs         # guard tests
 ```
+
+A `pi install git:` copy lives at `~/.pi/agent/git/github.com/AllenDang/fr-batch`, and
+`pi update` **resets and cleans** that clone — so edit your own checkout and point pi at it
+with a local-path package (`pi install /path/to/fr-batch`) rather than editing in place.
 
 `tests/run.mjs` runs six probe files against the real modules and throwaway git repos — 195
 assertions. It covers the supervisor-ask classification and reply file, the detach marker, the
@@ -491,6 +531,11 @@ functions. The split removed the whole mechanism.
 Then `/reload` in any running session to pick the change up — **but not while a batch is
 running**: the driver is an in-process loop, and `session_shutdown` aborts it.
 
-`tsconfig.json` maps the three pi packages out of the global install, so this works
-without a local `npm install`. `allowImportingTsExtensions` is on because pi resolves
-`./x.ts` specifiers as written.
+`tsconfig.json` maps the three pi packages out of pi's own global install, so this works
+without a local `npm install`. It reaches them through `.types/`, a gitignored symlink farm
+that `tests/typecheck.mjs` builds from `npm root -g` (override with `PI_PKG_ROOT`); the paths
+used to be spelled `/opt/homebrew/...` in the committed config, which is one node
+installation out of several — under nvm the directory does not exist, and both `tsc` and an
+editor then reported every pi import as unresolved. `--link-only` refreshes the links without
+typechecking, which is all an LSP needs. `allowImportingTsExtensions` is on because pi
+resolves `./x.ts` specifiers as written.
