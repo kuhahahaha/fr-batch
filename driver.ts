@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { childSpawnParams, effortUndeliverable, itemModelLabel, modelLabel, resolveChildConfig, sessionChildConfig } from "./config.ts";
 import { AUDIT_PARSE_RETRIES, freezeContract, loadLedger, parseFixReport, parseVerdict, partitionGaps, planTestGate, recordOutOfScope, saveLedger } from "./contract.ts";
-import { contractPath, ledgerPath, runlockPath } from "./paths.ts";
+import { contractPath, ledgerPath, queuePath, runlockPath } from "./paths.ts";
 import { auditTask, fixTask, implementTask, readsBlock, rulesBlock } from "./prompts.ts";
 import { INTERCOM_DETACH_MARK, NetworkPause, formatAsk, runChildResilient } from "./resilience.ts";
 import { makeRpc } from "./rpc.ts";
@@ -93,7 +93,7 @@ export async function runBatch(
     return [
       "fr-batch: REFUSED — queue is not armed.",
       "",
-      'Set `"armed": true` in .pi/extensions/fr-batch/queue.json when you actually want the batch',
+      `Set \`"armed": true\` in ${queuePath(cwd)} when you actually want the batch`,
       "to write to this repo, and make sure no other session is working in it (the implementer edits",
       "the tree in place; two writers corrupt each other).",
     ].join("\n");
