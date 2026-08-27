@@ -8,12 +8,12 @@
     "module": "esnext",
     "moduleResolution": "bundler",
     "lib": ["es2023", "dom"],
-    "typeRoots": ["/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@types"], "types": ["node"],
+    "typeRoots": [".types/@types"], "types": ["node"],
     "baseUrl": ".",
     "paths": {
-      "@earendil-works/pi-coding-agent": ["/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"],
-      "@earendil-works/pi-ai": ["/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.d.ts"],
-      "typebox": ["/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/typebox/build/index.d.mts"]
+      "@earendil-works/pi-coding-agent": [".types/pi-coding-agent/dist/index.d.ts"],
+      "@earendil-works/pi-ai": [".types/pi-ai/dist/index.d.ts"],
+      "typebox": [".types/typebox/build/index.d.mts"]
     }
   },
   "include": ["*.ts"]

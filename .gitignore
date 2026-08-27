@@ -1,7 +1,9 @@
-# Nothing generated lives here: no build step, no bundler, no node_modules — tsconfig.json
-# maps the pi packages out of the global install, and pi loads the .ts files directly.
+# Nothing generated lives here: no build step, no bundler, no node_modules — `.types/` is a
+# symlink farm into pi's own global install (built by `node tests/typecheck.mjs`), and pi
+# loads the .ts files directly.
 # So this file exists only to keep editor/OS droppings and a stray local install out.
 node_modules/
+.types/
 *.log
 *.bak
 .DS_Store

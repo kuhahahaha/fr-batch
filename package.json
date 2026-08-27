@@ -1,5 +1,9 @@
 {
   "name": "fr-batch",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "keywords": ["pi-package", "pi", "pi-coding-agent", "extension", "batch"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
 }
