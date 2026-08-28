@@ -10,10 +10,48 @@ import { makeRpc } from "./rpc.ts";
 import type { ChildOutcome } from "./rpc.ts";
 import { acquireRunlock, artifactDir, loadProgress, loadQueue, pruneItemArtifacts, setProgress, statusOf, transientPolicy, transientQuotaPolicy, verifyFor } from "./store.ts";
 import { AUDIT_SCHEMA, CHILD_ROLES, FIX_SCHEMA, UNPARSEABLE_GAP_ID } from "./types.ts";
-import type { ChildConfig, ChildRole, Ledger, LedgerEntry, Log, Phase, Progress } from "./types.ts";
+import type { AuditVerdict, ChildConfig, ChildRole, Ledger, LedgerEntry, Log, Phase, Progress } from "./types.ts";
 
 /** Rows a dry run prints before it starts counting instead of listing. */
 export const DRYRUN_ROWS = 20;
+
+/**
+ * What to say when pi-subagents cannot find one of the three agents this driver spawns.
+ *
+ * The failure used to be unreadable from here: the run died 37ms after launch with `Unknown
+ * agent: fr-implementer`, that text lived only in the run's own status.json, and the driver
+ * reported `implementing` for 51 minutes. Both halves are fixed — rpc.ts settles from the run's
+ * state, and this names the cause — because a fresh install hitting this needs the fix, not a
+ * diagnosis.
+ */
+export const UNKNOWN_AGENT_HINT = [
+  "This is an INSTALL problem, not a PLAN problem: pi-subagents could not find one of the three",
+  "agent definitions this driver spawns (fr-implementer, fr-test-auditor, fr-gap-fixer).",
+  "They ship inside this extension's own `agents/` directory, declared by package.json",
+  '`"pi-subagents": { "agents": ["./agents"] }`. Seeing this means the installed copy predates that,',
+  "or the package filter dropped it. Update the extension (`pi update`) and /reload, or copy the",
+  "three files into ~/.pi/agent/agents/ as a stopgap. `/subagents` lists what pi-subagents can see.",
+].join("\n");
+
+/**
+ * A launched child that did not end in a success state, rendered for a `block` message — or null
+ * when it succeeded.
+ *
+ * `error` is included because that is where a launch failure lives; the old message printed only
+ * `summary`, which for a workflow that never started is the empty string. "Implementer ended with
+ * status failed. Summary:" was the whole report.
+ */
+export function childOutcomeFailure(role: string, o: ChildOutcome): string | null {
+  if (o.status === "complete" || o.status === "completed" || o.status === "success") return null;
+  const both = `${o.error ?? ""} ${o.summary ?? ""}`;
+  return [
+    `${role} ended with status "${o.status}".`,
+    ...(o.error?.trim() ? [`error: ${o.error.trim().slice(0, 900)}`] : []),
+    ...(o.summary?.trim() ? [`summary: ${o.summary.trim().slice(0, 900)}`] : []),
+    ...(o.artifactPath ? [`report: ${o.artifactPath}`] : []),
+    ...(/unknown agent/i.test(both) ? ["", UNKNOWN_AGENT_HINT] : []),
+  ].join("\n");
+}
 
 export async function runVerify(
   pi: ExtensionAPI,
@@ -130,6 +168,40 @@ export async function runBatch(
     return `fr-batch: REFUSED — another driver holds the run lock (${lock.held}). Delete ${runlockPath(cwd)} if that process is gone.`;
   }
 
+  // EACH ITEM COMMITS WITH `git add -A`, so anything this driver writes inside the repo lands in
+  // the user's history unless the repo ignores it. Both trees are ours and neither belongs in a
+  // PLAN's commit: `.pi/fr-batch/` holds the queue, the progress file, the frozen contract and the
+  // ledger; `.pi-subagents/` holds child transcripts at ~1-2MB each. Checked once per run, before
+  // anything is written, because a commit that already swallowed them cannot be un-made by this
+  // driver.
+  {
+    const unignored: string[] = [];
+    for (const p of [".pi", ".pi-subagents"]) {
+      // Queried WITH a trailing slash, which is not cosmetic: `git check-ignore .pi-subagents`
+      // exits 1 against a `/.pi-subagents/` rule while the directory does not exist yet, because
+      // git cannot know a nonexistent path is a directory and a dir-only pattern then cannot
+      // match. Measured on ange, whose .gitignore has exactly that rule. A trailing slash matches
+      // both spellings of the rule (`/.pi` and `/.pi/`), so it is the correct probe in all cases.
+      const r = await pi.exec("git", ["check-ignore", "-q", `${p}/`], { cwd });
+      if (r.code !== 0) unignored.push(p);
+    }
+    if (unignored.length > 0) {
+      lock.release();
+      return [
+        `fr-batch: REFUSED — this repo does not ignore ${unignored.join(" or ")}.`,
+        "",
+        "Every item commits with `git add -A`, so the driver's own state would be committed into",
+        "your history: the queue and progress files, each item's frozen audit contract and gap",
+        "ledger, and every child's transcript (~1-2MB per spawn).",
+        "",
+        "Fix, once:",
+        ...unignored.map((p) => `  echo '/${p}/' >> .gitignore`),
+        "",
+        "Then commit that .gitignore change and re-run.",
+      ].join("\n");
+    }
+  }
+
   const dir = artifactDir(cwd);
   let committed = 0;
 
@@ -185,7 +257,11 @@ export async function runBatch(
           "",
           progress[item.id]?.note ?? "",
           "",
-          `Fix it, then re-run. To redo it from scratch, run fr_batch action "reset" with only: "${item.id}".`,
+          "A block is STICKY: re-running does not retry it, because the recorded phase and this",
+          "item's frozen contract are still on disk and the driver will not guess which of them the",
+          "fix invalidated. Once you have fixed the cause, clear the state deliberately:",
+          `  fr_batch action "reset", only: "${item.id}"   — re-implements from scratch and re-freezes the contract`,
+          `  fr_batch action "remove", only: "${item.id}"  — drops it from the queue instead`,
         ].join("\n");
       }
 
@@ -290,7 +366,11 @@ export async function runBatch(
         [
           `fr-batch: PAUSED at ${item.id} (${phase}). ${committed} item(s) committed before it.`,
           "",
-          progress[item.id]?.note ?? "Network unreachable after the configured retries.",
+          // Read back from disk, not from the snapshot this iteration started with: the note that
+          // explains the pause was written by handlePause AFTER that snapshot was taken, so the
+          // in-memory copy still holds the pre-pause note (usually none) and this message used to
+          // fall back to a generic line that named no signature.
+          loadProgress(cwd)[item.id]?.note ?? "Network unreachable after the configured retries.",
           "",
           "Nothing was committed. The child's session is preserved, so continuing revives it",
           "instead of redoing the work.",
@@ -436,9 +516,8 @@ export async function runBatch(
         // report "changed no files" or a green item instead of the question.
         const implDecision = decisionStop("implement", impl, fixRoundsSoFar);
         if (implDecision) return implDecision;
-        if (impl.status !== "complete" && impl.status !== "completed" && impl.status !== "success") {
-          return block(`Implementer ended with status "${impl.status}". Summary: ${impl.summary.slice(0, 800)}`);
-        }
+        const implFailure = childOutcomeFailure("Implementer", impl);
+        if (implFailure) return block(implFailure);
         const after = await pi.exec("git", ["status", "--porcelain"], { cwd });
         if ((after.stdout ?? "").trim().length === 0) {
           return block("Implementer reported success but changed no files. Treating as a failure, not a no-op success.");
@@ -515,87 +594,106 @@ test is right and the implementation is wrong, fix the implementation. Do NOT co
           }
           const fixVerifyDecision = decisionStop("fix-verify", fixVerify, round);
           if (fixVerifyDecision) return fixVerifyDecision;
+          // A fixer that never ran cannot have fixed anything, and looping back to verify would
+          // spend another round rediscovering the same red gate.
+          const fixVerifyFailure = childOutcomeFailure("Fixer (red verify)", fixVerify);
+          if (fixVerifyFailure) return block(fixVerifyFailure);
           continue;
         }
         log("  verify GREEN");
 
-        setProgress(cwd, item.id, { status: "auditing", fixRounds: round });
-        log("  audit…");
+        // The audit is retried WITHOUT re-running verify. An unparseable verdict is the auditor's
+        // transport failing, and the gate that just passed cannot have become red in between — so
+        // looping back to the top would re-spend the whole verify budget (a full compile plus the
+        // suite, up to verifyTimeoutMs PER COMMAND) twice to re-ask one question. Hence this inner
+        // loop: only the auditor re-runs.
+        let verdict!: AuditVerdict;
         const verdictPath = join(dir, `${item.id}-audit-${round}.json`);
-        let audit: ChildOutcome | undefined;
+        let rawPath = verdictPath;
         for (;;) {
-          try {
-            audit = await runChildResilient(
-              pi,
-              rpc,
-              {
-                agent: "fr-test-auditor",
-                ...spawnFor("auditor"),
-                context: "fresh",
-                task: auditTask(item, contract, loadLedger(cwd, item.id)),
-                outputSchema: AUDIT_SCHEMA,
-                output: verdictPath,
-                outputMode: "file-only",
-              },
-              q.childTimeoutMs,
-              opts.signal,
-              policy,
-              log,
-              { ...resumeFor("audit"), quotaPolicy },
-            );
-            break;
-          } catch (e) {
-            if (e instanceof NetworkPause) {
-              if (await handlePause("audit", e, round)) continue;
-              return pausedReturn("audit");
+          setProgress(cwd, item.id, { status: "auditing", fixRounds: round });
+          log(auditAttempt > 0 ? `  audit (retry ${auditAttempt}/${AUDIT_PARSE_RETRIES})…` : "  audit…");
+          let audit: ChildOutcome | undefined;
+          for (;;) {
+            try {
+              audit = await runChildResilient(
+                pi,
+                rpc,
+                {
+                  agent: "fr-test-auditor",
+                  ...spawnFor("auditor"),
+                  context: "fresh",
+                  task: auditTask(item, contract, loadLedger(cwd, item.id)),
+                  outputSchema: AUDIT_SCHEMA,
+                  output: verdictPath,
+                  outputMode: "file-only",
+                },
+                q.childTimeoutMs,
+                opts.signal,
+                policy,
+                log,
+                { ...resumeFor("audit"), quotaPolicy },
+              );
+              break;
+            } catch (e) {
+              if (e instanceof NetworkPause) {
+                if (await handlePause("audit", e, round)) continue;
+                return pausedReturn("audit");
+              }
+              return abortStop("audit", round) ?? block(`Auditor failed to run: ${(e as Error).message}`);
             }
-            return abortStop("audit", round) ?? block(`Auditor failed to run: ${(e as Error).message}`);
           }
-        }
 
-        const auditDecision = decisionStop("audit", audit, round);
-        if (auditDecision) return auditDecision;
+          const auditDecision = decisionStop("audit", audit, round);
+          if (auditDecision) return auditDecision;
 
-        // PREFER THE STRUCTURED OUTPUT. The auditor runs with an outputSchema, so
-        // its schema-valid verdict arrives on the completion event; the artifact
-        // FILE is where its prose narration lands. Reading the file first is why
-        // this driver kept synthesising AUDIT-UNPARSEABLE and throwing away real
-        // gaps. File and summary remain fallbacks for an auditor without a schema.
-        const structured = audit.structuredOutput;
-        const rawPath = audit.artifactPath && existsSync(audit.artifactPath) ? audit.artifactPath : verdictPath;
-        const raw = structured !== undefined && structured !== null
-          ? JSON.stringify(structured)
-          : existsSync(rawPath)
-            ? readFileSync(rawPath, "utf8")
-            : audit.summary;
-        const verdict = parseVerdict(raw);
+          // An auditor that did not RUN is an infrastructure failure, and it must be reported as
+          // one here. Falling through to the verdict parser would classify it as an unparseable
+          // verdict and then blame the schema for a bad install or a dead workflow.
+          const auditFailure = childOutcomeFailure("Auditor", audit);
+          if (auditFailure) return block(auditFailure);
 
-        // AN UNPARSEABLE VERDICT IS A TRANSPORT FAILURE, NOT A COVERAGE GAP, so it
-        // must never reach the ledger. Letting it in deadlocks the item: no fixer
-        // can close "the auditor did not return a schema-valid verdict" — there is
-        // no code seam to name and no edit that could go RED — so the convergence
-        // check sees the same count every round and blocks forever. Both observed
-        // causes were pure transport: once the child's prose landed in the output
-        // slot, once a Bedrock outage streamed raw session JSONL where the schema
-        // object belonged. In the second case a schema-valid audit had ALREADY
-        // walked all 29 contract rows and returned `complete` with no gaps, and the
-        // driver threw that away and blocked. Retry the audit instead; only give up
-        // after `auditRetries`, and then say it is infrastructure rather than
-        // filing a gap the fixer is expected to close.
-        const onlyUnparseable =
-          verdict.gaps.length === 1 && (verdict.gaps[0].id ?? "").trim() === UNPARSEABLE_GAP_ID;
-        if (onlyUnparseable) {
-          if (auditAttempt < AUDIT_PARSE_RETRIES) {
-            auditAttempt++;
-            log(`  audit verdict unparseable (transport) — retrying audit ${auditAttempt}/${AUDIT_PARSE_RETRIES}`);
-            continue;
+          // PREFER THE STRUCTURED OUTPUT. The auditor runs with an outputSchema, so
+          // its schema-valid verdict arrives on the completion event; the artifact
+          // FILE is where its prose narration lands. Reading the file first is why
+          // this driver kept synthesising AUDIT-UNPARSEABLE and throwing away real
+          // gaps. File and summary remain fallbacks for an auditor without a schema.
+          const structured = audit.structuredOutput;
+          rawPath = audit.artifactPath && existsSync(audit.artifactPath) ? audit.artifactPath : verdictPath;
+          const raw = structured !== undefined && structured !== null
+            ? JSON.stringify(structured)
+            : existsSync(rawPath)
+              ? readFileSync(rawPath, "utf8")
+              : audit.summary;
+          verdict = parseVerdict(raw);
+
+          // AN UNPARSEABLE VERDICT IS A TRANSPORT FAILURE, NOT A COVERAGE GAP, so it
+          // must never reach the ledger. Letting it in deadlocks the item: no fixer
+          // can close "the auditor did not return a schema-valid verdict" — there is
+          // no code seam to name and no edit that could go RED — so the convergence
+          // check sees the same count every round and blocks forever. Both observed
+          // causes were pure transport: once the child's prose landed in the output
+          // slot, once a Bedrock outage streamed raw session JSONL where the schema
+          // object belonged. In the second case a schema-valid audit had ALREADY
+          // walked all 29 contract rows and returned `complete` with no gaps, and the
+          // driver threw that away and blocked. Retry the audit instead; only give up
+          // after AUDIT_PARSE_RETRIES, and then say it is infrastructure rather than
+          // filing a gap the fixer is expected to close.
+          const onlyUnparseable =
+            verdict.gaps.length === 1 && (verdict.gaps[0].id ?? "").trim() === UNPARSEABLE_GAP_ID;
+          if (!onlyUnparseable) {
+            auditAttempt = 0;
+            break;
           }
-          return block(
-            `Auditor returned an unparseable verdict ${AUDIT_PARSE_RETRIES + 1} time(s). This is the auditor's ` +
-              `TRANSPORT, not a test gap: no gap was filed and the ledger is untouched. Raw head: ${raw.slice(0, 300)}`,
-          );
+          if (auditAttempt >= AUDIT_PARSE_RETRIES) {
+            return block(
+              `Auditor returned an unparseable verdict ${AUDIT_PARSE_RETRIES + 1} time(s). This is the auditor's ` +
+                `TRANSPORT, not a test gap: no gap was filed and the ledger is untouched. Raw head: ${raw.slice(0, 300)}`,
+            );
+          }
+          auditAttempt++;
+          log(`  audit verdict unparseable (transport) — re-running the auditor only, ${auditAttempt}/${AUDIT_PARSE_RETRIES}`);
         }
-        auditAttempt = 0;
 
         // Scope gate. An adversarial auditor asked to find gaps will always find one more;
         // only findings that name a row of the FROZEN contract may gate this item.
@@ -711,6 +809,8 @@ test is right and the implementation is wrong, fix the implementation. Do NOT co
 
         const fixAuditDecision = decisionStop("fix-audit", fix, round);
         if (fixAuditDecision) return fixAuditDecision;
+        const fixAuditFailure = childOutcomeFailure("Fixer (audit gaps)", fix);
+        if (fixAuditFailure) return block(fixAuditFailure);
 
         // Ingest the fixer's rejections. This is the only way an invalid gap dies: without it
         // the next audit re-raises it, and a re-raise now stops the batch.

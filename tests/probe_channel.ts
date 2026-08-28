@@ -1,9 +1,9 @@
 import { mkdirSync, mkdtempSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DECISION_DIRECTIVE, INTERCOM_DETACH_MARK, SUPERVISOR_CHANNEL_ROOT, answerAsk, findPendingAsks, formatAsk } from "../resilience.ts";
+import { DECISION_DIRECTIVE, INTERCOM_DETACH_MARK, answerAsk, findPendingAsks, formatAsk, supervisorChannelRoots } from "../resilience.ts";
 import { extractTestsSection, planTestGate } from "../contract.ts";
-const P = { DECISION_DIRECTIVE, INTERCOM_DETACH_MARK, SUPERVISOR_CHANNEL_ROOT, answerAsk, findPendingAsks, formatAsk, extractTestsSection, planTestGate };
+const P = { DECISION_DIRECTIVE, INTERCOM_DETACH_MARK, answerAsk, findPendingAsks, formatAsk, extractTestsSection, planTestGate };
 
 let fails = 0;
 const ok = (name: string, cond: boolean, extra = "") => {
@@ -12,8 +12,13 @@ const ok = (name: string, cond: boolean, extra = "") => {
 };
 
 // --- ask channel classification -------------------------------------------
+// The fixture goes under the LAST candidate root, which is the derived one
+// (`<tmpdir>/pi-subagents-<scope>/supervisor-channels`) rather than a constant this file names
+// itself. That distinction is why this suite used to pass while the layer was dead: it wrote into
+// `SUPERVISOR_CHANNEL_ROOT` and read back from it, which holds for ANY value that constant has.
+// probe_install.ts pins the roots against pi-subagents' own rule.
 const runId = `probe-${process.pid}`;
-const chan = join(P.SUPERVISOR_CHANNEL_ROOT, `${runId}-fr-implementer-0`);
+const chan = join(supervisorChannelRoots()[supervisorChannelRoots().length - 1], `${runId}-fr-implementer-0`);
 mkdirSync(join(chan, "requests"), { recursive: true });
 mkdirSync(join(chan, "replies"), { recursive: true });
 const req = (id: string, reason: string, message: string) =>
@@ -62,6 +67,7 @@ const gateFor = async (text: string | null) => {
 ok("gate blocks a missing PLAN", !(await gateFor(null)).ok);
 ok("gate blocks a PLAN with no tests section", !(await gateFor("# FR\n## Design\nstuff")).ok);
 ok("gate blocks a tests section with no rows", !(await gateFor("## Tests\n\nTBD.\n")).ok);
+ok("gate blocks a table skeleton with no data rows", !(await gateFor("## Tests\n\n| id | what |\n|---|---|\n")).ok);
 ok("gate passes a real matrix", (await gateFor("## 6. Tests\n\n| id | what | proves non-vacuous |\n|---|---|---|\n| T1 | a | edit x |\n| T2 | b | edit y |\n")).ok);
 ok("gate passes a bulleted matrix", (await gateFor("## Tests\n- T1 ... RED edit: x\n- T2 ... RED edit: y\n")).ok);
 const why = (await gateFor("# FR\n## Design\nstuff")) as { ok: false; why: string };

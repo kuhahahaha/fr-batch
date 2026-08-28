@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { writeAtomic } from "./paths.ts";
 import { runChild } from "./rpc.ts";
 import type { ChildOutcome } from "./rpc.ts";
@@ -12,8 +12,42 @@ import type { Log, SupervisorAsk, TransientPolicy } from "./types.ts";
 //   <TEMP_ROOT_DIR>/supervisor-channels/<runId>-<agent>-<childIndex>/
 //       requests/<requestId>.json   child writes, then polls replies/
 //       replies/<requestId>.json    we write { type, requestId, message }
-// (native-supervisor-channel.ts:18, :89-104, :210-221)
-export const SUPERVISOR_CHANNEL_ROOT = join(tmpdir(), "pi-subagents", "supervisor-channels");
+// (intercom/native-supervisor-channel.ts:19, :100-105, :225)
+//
+// TEMP_ROOT_DIR IS USER-SCOPED AND OVERRIDABLE, and getting that wrong silently disables this
+// whole layer. It is `PI_SUBAGENTS_TEMP_ROOT` when set, else
+// `<tmpdir>/pi-subagents-<scope>` where scope is `uid-<uid>` on any platform exposing getuid,
+// else `user-<USERNAME|USER|LOGNAME>`, else `home-<sanitised homedir>`, else `shared`
+// (shared/types.ts:2364-2414). A bare `<tmpdir>/pi-subagents` — what this file used to hardcode
+// — is a directory nothing creates: `findPendingAsks` returned [] forever, so a NETWORK_DOWN
+// report was never held and a decision ask was never answered. The only reason the guard suite
+// did not catch it is that the probe wrote its fixture into this same constant.
+function tempScopeId(): string {
+  if (typeof process.getuid === "function") return `uid-${process.getuid()}`;
+  for (const key of ["USERNAME", "USER", "LOGNAME"] as const) {
+    const v = process.env[key];
+    if (v) return `user-${v.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown"}`;
+  }
+  const home = process.env.HOME ?? process.env.USERPROFILE;
+  if (home) return `home-${home.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown"}`;
+  return "shared";
+}
+
+/**
+ * Every root a supervisor channel can live under, most authoritative first. Scanning a list
+ * rather than computing one root keeps a scope-id rule change in pi-subagents from silently
+ * disabling the layer again — an extra root that does not exist costs one `existsSync`.
+ *
+ * A FUNCTION, not a constant: `PI_SUBAGENTS_TEMP_ROOT` and the directory's existence are both
+ * runtime facts, and a module-load snapshot of either is how a path bug becomes invisible.
+ */
+export function supervisorChannelRoots(): string[] {
+  const configured = process.env.PI_SUBAGENTS_TEMP_ROOT?.trim();
+  return [
+    ...(configured ? [join(resolve(configured), "supervisor-channels")] : []),
+    join(tmpdir(), `pi-subagents-${tempScopeId()}`, "supervisor-channels"),
+  ];
+}
 
 // The child's ask deadline defaults to 10 min (native-supervisor-channel.ts:23)
 // and is read from the env, which children inherit from this process. A long
@@ -99,6 +133,14 @@ export const TRANSIENT_SIGNATURES: RegExp[] = [
   /upstream (?:error|connect)/i,
   /connection (?:error|closed|reset|aborted)/i,
   /stream (?:error|interrupted|closed)/i,
+  // `ended` is a fourth word for the same event, and its absence cost a whole item: a Bedrock
+  // response stream died mid-write with "Bedrock stream ended without a stop reason", which
+  // matched nothing here, was therefore filed as a REAL failure, and blocked an implementer that
+  // had already written three complete files and was starting the fourth. With `resumeOnRetry`
+  // that child would have been revived with its context and those files intact.
+  /stream ended without a stop reason/i,
+  /stream (?:ended|terminated) (?:unexpectedly|prematurely|without)/i,
+  /unexpected end of (?:stream|response|json)/i,
   /api ?error/i,
   // A bare "aborted" from a model attempt. The child cannot report a provider
   // outage itself (it is a `pi --mode json -p` subprocess and the failure is in
@@ -238,34 +280,42 @@ export async function waitForRecovery(ms: number, p: TransientPolicy, signal: Ab
  */
 export function findPendingAsks(asyncId: string): SupervisorAsk[] {
   const out: SupervisorAsk[] = [];
-  if (!existsSync(SUPERVISOR_CHANNEL_ROOT)) return out;
-  let dirs: string[];
-  try {
-    dirs = readdirSync(SUPERVISOR_CHANNEL_ROOT);
-  } catch {
-    return out;
-  }
-  for (const d of dirs) {
-    // Channel dirs are `<runId>-<agent>-<childIndex>` (native-supervisor-channel.ts:89-91).
-    if (!d.startsWith(`${asyncId}-`)) continue;
-    const reqDir = join(SUPERVISOR_CHANNEL_ROOT, d, "requests");
-    const repDir = join(SUPERVISOR_CHANNEL_ROOT, d, "replies");
-    let files: string[];
+  for (const root of supervisorChannelRoots()) {
+    if (!existsSync(root)) continue;
+    let dirs: string[];
     try {
-      files = readdirSync(reqDir).filter((f) => f.endsWith(".json"));
+      dirs = readdirSync(root);
     } catch {
       continue;
     }
-    for (const f of files) {
-      const requestId = f.replace(/\.json$/, "");
-      if (existsSync(join(repDir, f))) continue; // already answered
+    for (const d of dirs) {
+      // Channel dirs are `<runId>-<agent>-<childIndex>`, and that runId is the ASYNC RUN's id
+      // (subagent-runner.ts passes `runId: ctx.id` into the child's env), which is the id spawn
+      // handed back — so a prefix match is the right test.
+      if (!d.startsWith(`${asyncId}-`)) continue;
+      const reqDir = join(root, d, "requests");
+      const repDir = join(root, d, "replies");
+      let files: string[];
       try {
-        const req = JSON.parse(readFileSync(join(reqDir, f), "utf8")) as { reason?: string; message?: string };
-        const text = `${req.reason ?? ""} ${req.message ?? ""}`;
-        const isNetwork = text.includes(NETWORK_ASK_MARKER) || transientHit(text) !== null;
-        out.push({ channelDir: join(SUPERVISOR_CHANNEL_ROOT, d), requestId, reason: req.reason, message: req.message, isNetwork });
+        files = readdirSync(reqDir).filter((f) => f.endsWith(".json"));
       } catch {
-        /* a half-written request file will be picked up on the next poll */
+        continue;
+      }
+      for (const f of files) {
+        const requestId = f.replace(/\.json$/, "");
+        if (existsSync(join(repDir, f))) continue; // already answered
+        try {
+          const req = JSON.parse(readFileSync(join(reqDir, f), "utf8")) as { reason?: string; message?: string; expiresAt?: number };
+          // An expired request is one the CHILD has already given up on (it stops polling at its
+          // deadline and the file is never cleaned up), so answering it releases nobody and
+          // reporting it would pause the item on a question that is no longer being asked.
+          if (typeof req.expiresAt === "number" && req.expiresAt > 0 && req.expiresAt < Date.now()) continue;
+          const text = `${req.reason ?? ""} ${req.message ?? ""}`;
+          const isNetwork = text.includes(NETWORK_ASK_MARKER) || transientHit(text) !== null;
+          out.push({ channelDir: join(root, d), requestId, reason: req.reason, message: req.message, isNetwork });
+        } catch {
+          /* a half-written request file will be picked up on the next poll */
+        }
       }
     }
   }

@@ -2,13 +2,39 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSyn
 import { dirname, join } from "node:path";
 import { assertChildConfig, assertRoleConfigs } from "./config.ts";
 import { baseDir, historyPath, progressPath, queuePath, runlockPath, writeAtomic } from "./paths.ts";
-import { TRANSIENT_DEFAULTS, TRANSIENT_QUOTA_DEFAULTS } from "./types.ts";
+import { QUEUE_BUDGET_DEFAULTS, TRANSIENT_DEFAULTS, TRANSIENT_QUOTA_DEFAULTS } from "./types.ts";
 import type { HistoryEntry, ItemStatus, Log, Progress, ProgressEntry, Queue, QueueItem, TransientPolicy } from "./types.ts";
 
 export const STALE_RUNLOCK_MS = 15 * 60 * 1000;
 
 /** How often the live driver refreshes its run lock's mtime, so a long run never looks stale. */
 export const RUNLOCK_TOUCH_MS = 60 * 1000;
+
+/**
+ * One of the three numeric budgets, resolved at LOAD time: default when the queue omits it,
+ * hard error when it carries something unusable.
+ *
+ * Both halves matter and they fail differently. An omitted `childTimeoutMs` used to travel as
+ * `undefined` into `setTimeout(fn, timeoutMs + 60_000)`, i.e. `setTimeout(fn, NaN)`, which fires
+ * on the next tick — so every child "exceeded undefinedms" milliseconds after launch and the
+ * only clue was that word in the error text. A `"3h"` string or a `0` fails the same way with a
+ * different arithmetic accident, so a present value is checked rather than coerced.
+ *
+ * Defaulting rather than refusing is deliberate: these are budgets, not gates. `defaultVerify`
+ * refuses to default because an empty gate silently passes everything; a missing timeout has a
+ * safe, statable value, and a fresh install that works is worth more than a lecture.
+ */
+function budget(field: "maxFixRounds" | "childTimeoutMs" | "verifyTimeoutMs", raw: unknown): number {
+  if (raw === undefined || raw === null) return QUEUE_BUDGET_DEFAULTS[field];
+  const min = field === "maxFixRounds" ? 0 : 1;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < min || (field === "maxFixRounds" && !Number.isInteger(raw))) {
+    throw new Error(
+      `fr-batch: queue.${field} must be a ${field === "maxFixRounds" ? "whole number >= 0" : "positive number of milliseconds"}, ` +
+        `got ${JSON.stringify(raw)}. Remove it to accept the default (${QUEUE_BUDGET_DEFAULTS[field]}).`,
+    );
+  }
+  return raw;
+}
 
 export function loadQueue(cwd: string): Queue {
   const p = queuePath(cwd);
@@ -19,6 +45,10 @@ export function loadQueue(cwd: string): Queue {
     throw new Error("fr-batch: queue.defaultVerify must be a non-empty array — an empty verify gate is no gate");
   }
   const seen = new Set<string>();
+  // Filled in place, so every `q.childTimeoutMs` read downstream is a number by construction.
+  q.maxFixRounds = budget("maxFixRounds", q.maxFixRounds);
+  q.childTimeoutMs = budget("childTimeoutMs", q.childTimeoutMs);
+  q.verifyTimeoutMs = budget("verifyTimeoutMs", q.verifyTimeoutMs);
   assertChildConfig("queue", { model: q.defaultModel, thinking: q.defaultThinking });
   assertRoleConfigs("queue.roles", q.roles);
   for (const item of q.items) {
@@ -77,15 +107,19 @@ export function setProgress(cwd: string, id: string, patch: Partial<ProgressEntr
   // Read-modify-write against the file, not against a snapshot: `run` is the only
   // writer, but a crash mid-batch must not lose earlier items' state.
   const all = loadProgress(cwd);
+  // Resolved, not `patch.status`: a patch that omits status (a bare fixRounds bump) inherits the
+  // stored one, and keying the pause block off the patch alone would then WIPE a live pause's
+  // phase, child id and question — the fields `continue` needs to revive that child.
+  const status = patch.status ?? all[id]?.status ?? "pending";
   const next: ProgressEntry = {
-    status: patch.status ?? all[id]?.status ?? "pending",
+    status,
     fixRounds: patch.fixRounds ?? all[id]?.fixRounds ?? 0,
     updatedAt: new Date().toISOString(),
     ...(patch.note !== undefined ? { note: patch.note } : all[id]?.note ? { note: all[id].note } : {}),
     ...(patch.sha !== undefined ? { sha: patch.sha } : all[id]?.sha ? { sha: all[id].sha } : {}),
     // Pause fields are meaningful only while paused: any other status clears them,
     // so a stale childId can never be revived into the wrong phase.
-    ...(patch.status === "paused"
+    ...(status === "paused"
       ? {
           ...(patch.pausedPhase !== undefined ? { pausedPhase: patch.pausedPhase } : all[id]?.pausedPhase ? { pausedPhase: all[id].pausedPhase } : {}),
           ...(patch.pausedChildId !== undefined ? { pausedChildId: patch.pausedChildId } : all[id]?.pausedChildId ? { pausedChildId: all[id].pausedChildId } : {}),
@@ -202,7 +236,17 @@ export function pruneItemArtifacts(cwd: string, id: string, log: Log): void {
   } catch {
     return;
   }
-  const roundOf = (f: string): number => Number(f.match(/-audit-(\d+)\.json$/)?.[1] ?? -1);
+  // `<id>-audit-<N>.json` ONLY. The old `/-audit-(\d+)\.json$/` also matched
+  // `<id>-fix-audit-<N>.json`, so the "last verdict" it kept could be the FIXER's report while the
+  // audit verdict was deleted — and that verdict is the file the commit and block messages point
+  // at (`Full verdict: <path>`). Matched by prefix + suffix instead, because an item id is
+  // user-supplied and would have to be regex-escaped to appear in a pattern.
+  const roundOf = (f: string): number => {
+    const head = `${id}-audit-`;
+    if (!f.startsWith(head) || !f.endsWith(".json")) return -1;
+    const mid = f.slice(head.length, -".json".length);
+    return /^\d+$/.test(mid) ? Number(mid) : -1;
+  };
   const lastVerdict = files.filter((f) => roundOf(f) >= 0).sort((a, b) => roundOf(a) - roundOf(b)).pop();
   const keep = new Set([lastVerdict, `${id}-implement.md`].filter(Boolean) as string[]);
   let freed = 0;
@@ -216,8 +260,8 @@ export function pruneItemArtifacts(cwd: string, id: string, log: Log): void {
       /* ignore */
     }
   }
-  const dropped = files.length - keep.size;
-  if (dropped > 0) log(`  pruned ${dropped} intermediate round artifact(s) (${Math.round(freed / 1024)}KB); kept ${[...keep].join(", ")}`);
+  const dropped = files.filter((f) => !keep.has(f)).length;
+  if (dropped > 0) log(`  pruned ${dropped} intermediate round artifact(s) (${Math.round(freed / 1024)}KB); kept ${[...keep].filter((f) => files.includes(f)).join(", ")}`);
 }
 
 // ---------------------------------------------------------------------------

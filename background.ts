@@ -115,6 +115,12 @@ export async function startDriver(pi: ExtensionAPI, ctx: ExtensionContext, opts:
     return finishedRuns.get(cwd)?.text ?? "fr-batch: the batch ended immediately without a result.";
   }
   d.detached = true;
+  // The race and this flag are two steps, and a run that settles BETWEEN them would have been
+  // reported by nobody: finishDriver returns early while `detached` is still false (so the
+  // starting call can return the text inline), and the starting call was about to claim the batch
+  // is still running. Re-check the record after flipping the flag and hand back the real result.
+  const already = finishedRuns.get(cwd);
+  if (already && !drivers.has(cwd)) return already.text;
 
   return [
     `fr-batch: running in the background${opts.only ? ` (only: ${opts.only})` : ""} — ${lastLogLine(d)}`,

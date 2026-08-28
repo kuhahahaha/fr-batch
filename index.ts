@@ -2,7 +2,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { rmSync } from "node:fs";
-import { join } from "node:path";
 import { startDriver, stopDriver } from "./background.ts";
 import { sessionChildConfig } from "./config.ts";
 import { runBatch } from "./driver.ts";

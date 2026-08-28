@@ -5,5 +5,8 @@
   "keywords": ["pi-package", "pi", "pi-coding-agent", "extension", "batch"],
   "pi": {
     "extensions": ["./index.ts"]
+  },
+  "pi-subagents": {
+    "agents": ["./agents"]
   }
 }

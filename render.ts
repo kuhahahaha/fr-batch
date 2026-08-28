@@ -286,6 +286,10 @@ export function renderStatus(cwd: string, session: ChildConfig = {}, view: Statu
     // separately, so a reader who sees only "6 attempts" would draw the wrong conclusion
     // about what happens on a 429.
     `quota retry:   ${qpol.maxRetries} attempt(s), ${Math.round(qpol.baseDelayMs / 1000)}s→${Math.round(qpol.maxDelayMs / 1000)}s backoff (429 / insufficient_quota / rate limit — counted apart from network)`,
+    // Rendered because they are RESOLVED values, not the file's: loadQueue fills any budget the
+    // queue omits, and a reader has to be able to tell a configured 3h from a defaulted one
+    // without diffing queue.json against the defaults.
+    `budgets: child ${elapsedLabel(q.childTimeoutMs)} · verify ${elapsedLabel(q.verifyTimeoutMs)} per gate run · maxFixRounds ${q.maxFixRounds}`,
     `queue (yours):     ${queuePath(cwd)}`,
     `progress (driver): ${progressPath(cwd)}`,
   ].join("\n");

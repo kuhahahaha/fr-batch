@@ -14,7 +14,7 @@ sh("git", ["init", "-q"]);
 sh("git", ["config", "user.email", "t@t"]); sh("git", ["config", "user.name", "t"]);
 writeFileSync(join(repo, "docs/FR_x_PLAN.md"), "# FR x\n\n## 5. Tests — the branch matrix\n\n| id | what | proves non-vacuous |\n|---|---|---|\n| T1 | a | edit a |\n| T2 | b | edit b |\n");
 writeFileSync(join(repo, "docs/FR_notests_PLAN.md"), "# FR y\n\n## Design\n\nno matrix here\n");
-writeFileSync(join(repo, ".gitignore"), ".pi/\n");
+writeFileSync(join(repo, ".gitignore"), "/.pi/\n/.pi-subagents/\n"); // both trees are the driver's own; runBatch refuses if either is committable
 sh("git", ["add", "-A"]); sh("git", ["commit", "-qm", "init"]);
 
 const pi: any = {

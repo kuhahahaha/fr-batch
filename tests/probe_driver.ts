@@ -32,7 +32,7 @@ function makeRepo(): string {
   mkdirSync(join(repo, "docs"), { recursive: true });
   mkdirSync(join(repo, ".pi/fr-batch"), { recursive: true });
   writeFileSync(join(repo, "docs/FR_x_PLAN.md"), PLAN);
-  writeFileSync(join(repo, ".gitignore"), ".pi/\n");
+  writeFileSync(join(repo, ".gitignore"), "/.pi/\n/.pi-subagents/\n"); // both trees are the driver's own; runBatch refuses if either is committable
   sh("git", ["init", "-q"]);
   sh("git", ["config", "user.email", "t@t"]);
   sh("git", ["config", "user.name", "t"]);

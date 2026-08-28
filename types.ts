@@ -67,6 +67,17 @@ export interface TransientPolicy {
 export interface Queue {
   /** Hard interlock. `run` refuses while false. Flipping it to false mid-run stops gracefully. */
   armed: boolean;
+  /**
+   * The three budgets are REQUIRED here but OPTIONAL in the file: `loadQueue` fills any that
+   * the queue omits from QUEUE_BUDGET_DEFAULTS and rejects a present-but-unusable value, so
+   * every reader downstream can treat them as numbers.
+   *
+   * They used to be neither validated nor defaulted, and the failure was silent in the worst
+   * way: `undefined` reached `setTimeout(fn, timeoutMs + 60_000)` as `NaN`, which fires
+   * IMMEDIATELY, so every child died at once with `child exceeded undefinedms`, while a
+   * missing `maxFixRounds` made `round >= q.maxFixRounds` false forever and left the fix
+   * loop unbounded. The queue read as configured either way.
+   */
   maxFixRounds: number;
   childTimeoutMs: number;
   verifyTimeoutMs: number;
@@ -97,6 +108,18 @@ export interface Queue {
   roles?: RoleConfigs;
   items: QueueItem[];
 }
+
+/**
+ * Applied by `loadQueue` to any of the three budgets the queue omits. Values are the ones a
+ * real batch needs rather than round numbers: a child implementing a whole PLAN routinely runs
+ * over an hour, and a verify gate that compiles a C++ project and boots ~130 headless servers
+ * needs a budget in the tens of minutes.
+ */
+export const QUEUE_BUDGET_DEFAULTS = {
+  maxFixRounds: 4,
+  childTimeoutMs: 3 * 60 * 60 * 1000,
+  verifyTimeoutMs: 90 * 60 * 1000,
+} as const;
 
 export const TRANSIENT_DEFAULTS: TransientPolicy = {
   maxRetries: 6,

@@ -75,7 +75,14 @@ export async function planTestGate(pi: ExtensionAPI, cwd: string, item: QueueIte
     };
   }
   const section = extractTestsSection(text);
-  const rows = (section ?? "").split("\n").filter((l) => /^\s*(?:\||[-*]\s)/.test(l) && l.trim().length > 2);
+  // A table's HEADER and its `|---|---|` separator are both `|`-lines, so counting raw `|`-lines
+  // let an empty skeleton (`| id | what |` + `|---|---|`, zero data rows) pass the gate that
+  // exists to catch exactly that. Separators are dropped, and what remains must be a header plus
+  // at least one real row — or two bullets, for a PLAN whose matrix is a list.
+  const rows = (section ?? "")
+    .split("\n")
+    .filter((l) => /^\s*(?:\||[-*]\s)/.test(l) && l.trim().length > 2)
+    .filter((l) => !/^\s*\|?[\s:|-]*\|[\s:|-]*$/.test(l));
   if (!section || rows.length < 2) {
     return {
       ok: false,
@@ -92,8 +99,8 @@ export async function planTestGate(pi: ExtensionAPI, cwd: string, item: QueueIte
         "gate passes by vacuity — the batch would report a green item that was never checked.",
         "",
         "Fix: add a `## Tests` section to the PLAN with one row per behavior branch, each row naming",
-        "the edit that must make it RED (the `proves non-vacuous` column). The `write-fr-plan` skill",
-        "carries the required shape; `docs/FR_world_env_ibl_PLAN.md` is the model in this repo.",
+        "the edit that must make it RED (the `proves non-vacuous` column). A table needs a header AND",
+        "at least one data row; a bare skeleton is what this check is for.",
         "",
         `Then re-run. A heading counts when its text is "Tests" — "## 6. Tests — the branch matrix"`,
         "is fine, `### Test plan` is not.",
@@ -160,19 +167,34 @@ export function saveLedger(cwd: string, id: string, ledger: Ledger): void {
 /**
  * Split the auditor's findings into what may block and what may not.
  *
- * In scope = the gap's id appears verbatim in the frozen contract. Everything else
- * is the auditor writing new spec, which is legitimate output but not a gate on
- * THIS item. Enforced here and not only in the prompt: an agent told to prove the
- * tests incomplete will always find one more row to want.
+ * In scope = the gap's id occurs in the frozen contract AS A TOKEN. Everything else is the
+ * auditor writing new spec, which is legitimate output but not a gate on THIS item. Enforced
+ * here and not only in the prompt: an agent told to prove the tests incomplete will always find
+ * one more row to want.
+ *
+ * The match is token-bounded, not `includes`. A bare substring test made short ids match almost
+ * anything a contract happens to contain — `T1` is inside `T10`, `T1x`, and the word `T1`
+ * anywhere in prose — so an invented id could pass the scope gate and block the item, which is
+ * the one thing this function exists to prevent. Boundaries are non-alphanumeric on both sides,
+ * so `T1` matches `| T1 |` and `T1:` but not `T10`.
  */
 export function partitionGaps(gaps: AuditGap[], contract: string): { blocking: AuditGap[]; outOfScope: AuditGap[] } {
   const hay = contract.toLowerCase();
+  const inContract = (id: string): boolean => {
+    const needle = id.toLowerCase();
+    for (let at = hay.indexOf(needle); at >= 0; at = hay.indexOf(needle, at + 1)) {
+      const before = at === 0 ? "" : hay[at - 1]!;
+      const after = hay[at + needle.length] ?? "";
+      if (!/[a-z0-9]/.test(before) && !/[a-z0-9]/.test(after)) return true;
+    }
+    return false;
+  };
   const blocking: AuditGap[] = [];
   const outOfScope: AuditGap[] = [];
   for (const g of gaps) {
     const id = (g.id ?? "").trim();
-    const inScope = id === UNPARSEABLE_GAP_ID || (id.length > 0 && !/^new[-_ ]/i.test(id) && hay.includes(id.toLowerCase()));
-    (inScope ? blocking : outOfScope).push(g);
+    const scoped = id === UNPARSEABLE_GAP_ID || (id.length > 0 && !/^new[-_ ]/i.test(id) && inContract(id));
+    (scoped ? blocking : outOfScope).push(g);
   }
   return { blocking, outOfScope };
 }

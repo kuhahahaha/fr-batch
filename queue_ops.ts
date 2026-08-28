@@ -148,6 +148,33 @@ export function removeItem(cwd: string, id: string): string {
 }
 
 export function resetItem(cwd: string, id: string): string {
+  // REFUSED WHILE A DRIVER IS LIVE, for the same reason `archive` is: this deletes from
+  // progress.json, which the driver read-modify-writes at every phase transition, so a reset
+  // landing between its read and its write is silently undone and leaves an orphan. `archive` had
+  // this guard and `reset` did not — and reset is the one an operator is tempted to run while
+  // watching a batch that looks stuck (a real session was advised to reset a RUNNING item whose
+  // lock had been refreshed a minute earlier; only a human declining saved it).
+  const live = drivers.get(cwd);
+  if (live) {
+    return [
+      `fr-batch: refused — a driver is running here (${describeLive(live)}).`,
+      "Resetting now can be undone by its next write, and it would strand the child that is running.",
+      'Stop the batch first: fr_batch action "stop" (twice to abandon the child), then reset.',
+    ].join("\n");
+  }
+  const lock = runlockPath(cwd);
+  if (existsSync(lock) && Date.now() - statSync(lock).mtimeMs < STALE_RUNLOCK_MS) {
+    let holder = "unknown";
+    try {
+      holder = readFileSync(lock, "utf8").trim();
+    } catch {
+      /* ignore */
+    }
+    return [
+      `fr-batch: refused — a fresh run lock is present (${holder}), so another session may be driving this repo.`,
+      `Reset once it is done, or delete ${lock} if that process is gone.`,
+    ].join("\n");
+  }
   const all = loadProgress(cwd);
   const dropped = itemStateFiles(cwd, id).filter((p) => existsSync(p));
   if (!all[id] && dropped.length === 0) return `fr-batch: no progress entry for "${id}".`;

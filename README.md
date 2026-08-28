@@ -31,27 +31,52 @@ without it `action: "run"` fails on the 30 s RPC timeout with `is pi-subagents l
 Read [Disk footprint](#disk-footprint) before the first run — its default `artifactDir`
 writes to a directory nothing age-cleans.
 
+**The three agents this driver spawns ship with it**, in `agents/`, declared by package.json
+`"pi-subagents": { "agents": ["./agents"] }` — the key pi-subagents reads for package-supplied
+agent definitions. Nothing to install separately and nothing to place in `~/.pi/agent/agents/`.
+
+| agent | phase | writes | how it answers |
+|---|---|---|---|
+| `fr-implementer` | implement | yes | prose report |
+| `fr-test-auditor` | audit | **no** (no edit/write tool) | `structured_output` verdict |
+| `fr-gap-fixer` | fix (red verify, and audit gaps) | yes | `structured_output` report |
+
+If a run ever reports `Unknown agent: fr-implementer`, the installed copy predates this or a
+package filter dropped the directory: `pi update`, `/reload`, and check `/subagents`. That was
+the first-install failure mode for real — the definitions used to exist only on the author's
+machine, so a fresh install died on its first child while the guard suite stayed green.
+`tests/probe_install.ts` now fails if an agent the driver spawns is not shipped and declared.
+
 Then, in each repo the batch should work on:
 
 ```jsonc
 // <repo>/.pi/fr-batch/queue.json   — yours; the driver only reads it
 {
   "armed": false,                  // run refuses while false. Arm it deliberately.
-  "maxFixRounds": 4,
-  "childTimeoutMs": 5400000,
-  "verifyTimeoutMs": 1800000,
   "defaultVerify": ["scons", "scons test && bin/ange_test"],   // this repo's own gate
   "items": [
     { "id": "L0-base", "plan": "docs/FR_base_PLAN.md" }
   ]
+
+  // optional; shown with their defaults:
+  // "maxFixRounds": 4,
+  // "childTimeoutMs": 10800000,     // 3h — one child
+  // "verifyTimeoutMs": 5400000      // 90min, PER VERIFY COMMAND (not per pass)
 }
 ```
 
-`defaultVerify` and `items` are the only fields `loadQueue` validates — but do not trim the
-rest: `maxFixRounds`, `childTimeoutMs` and `verifyTimeoutMs` are read with no default, so
-omitting one leaves the fix loop or a timeout unbounded. Take the gate from the project's own
-context file rather than inventing one. `/fr-batch` then renders the queue and
-`action: "add"` appends to it, so this file is written by hand exactly once.
+`defaultVerify` and `items` are the only REQUIRED fields, and `defaultVerify` is required for a
+reason a default cannot satisfy: an empty gate silently passes everything. The three budgets are
+optional — omit one and it takes the default above; give one a value that is not a positive
+number and the queue is **refused at load, naming the field**. Both halves are new. They used to
+be read raw, and an omitted `childTimeoutMs` travelled as `undefined` into
+`setTimeout(fn, timeoutMs + 60_000)`, i.e. `setTimeout(fn, NaN)`, which fires immediately: every
+child died milliseconds after launch with `child exceeded undefinedms`, and an omitted
+`maxFixRounds` left the fix loop unbounded. `status` prints the resolved budgets, so a defaulted
+one is visible without diffing this file against the defaults.
+
+Take the gate from the project's own context file rather than inventing one. `/fr-batch` then
+renders the queue and `action: "add"` appends to it, so this file is written by hand exactly once.
 
 ## Files and who owns them
 
@@ -68,6 +93,11 @@ All per-project state lives under `<repo>/.pi/fr-batch/`:
 | `<id>.out-of-scope.md` | the driver | auditor findings the frozen contract does not ask for. Non-blocking; promote to a follow-up FR if worth having. |
 | `.run.lock` | the driver | single-driver interlock. Stale after 15 min; a live driver refreshes it every minute so a long run is never mistaken for a dead one. |
 | `<repo>/.pi-subagents/fr-batch/` | the driver | per-child output artifacts and audit verdicts. Intermediate rounds are pruned when the item commits; a blocked item keeps everything. |
+
+Both of those live **inside the repo**, and every item commits with `git add -A` — so `run`
+refuses to start until `.pi/` and `.pi-subagents/` are gitignored, naming the two lines to add. A
+commit that has already swallowed the driver's own queue, contract, ledger and child transcripts
+is not something this driver can un-make.
 
 The split is not cosmetic — it is what makes **adding an FR while the batch runs**
 safe. A single-file design would have the driver write back its in-memory snapshot
@@ -144,9 +174,11 @@ point:
    PLAN's `## Tests` matrix from HEAD. The fixer is still told to append rows to the live
    PLAN — that keeps the document truthful — but those rows are not in the contract, so
    they cannot come back as new demands.
-2. **Only in-contract ids can block.** A gap whose `id` does not appear verbatim in the
-   frozen contract is recorded in `<id>.out-of-scope.md` and dropped from the gate. This is
-   enforced in the driver, not just asked for in the prompt.
+2. **Only in-contract ids can block.** A gap whose `id` does not appear in the frozen contract
+   **as a token** is recorded in `<id>.out-of-scope.md` and dropped from the gate. This is
+   enforced in the driver, not just asked for in the prompt — and it is a token match, not a
+   substring one: a bare `includes` made `T1` "in contract" for any PLAN mentioning `T10`, so an
+   invented id could pass the one gate that keeps an item from being blocked by out-of-scope work.
 3. **The gap set must shrink, and nothing is re-litigated.** The ledger remembers every id
    and the rounds that raised it. A re-raised id, or a round whose in-contract gap count did
    not fall, stops the batch for a human instead of spending another round. The fixer's
@@ -363,6 +395,13 @@ So:
 | model API (the common case) | post-mortem, from the child's `error` / `modelAttempts[].error` | driver backs off, then **`resume`s** the same child — its session, context, and already-written files are intact |
 | a tool the child ran (fetch, install, clone) | the child reports it via `contact_supervisor` with a `NETWORK_DOWN:` message and blocks | driver holds it blocked through the same backoff, then writes the reply file to release it |
 
+That second row is only true if the driver looks in the right place, and for a long time it did
+not: the channel root is `PI_SUBAGENTS_TEMP_ROOT` or `<tmpdir>/pi-subagents-<uid-scope>`
+(pi-subagents `shared/types.ts`), not `<tmpdir>/pi-subagents`. With the wrong root every ask went
+unanswered, pi-subagents detached the child, and the driver saw an opaque `status: "paused"`. The
+roots are now derived from that rule and scanned as a list, and an expired request — one the child
+has already stopped polling — is skipped rather than surfaced as a live question.
+
 Three layers, three jobs:
 
 - **pi's in-child retry** (`retry.maxRetries: 3`, `baseDelayMs: 2000` → ~14 s) is
@@ -380,10 +419,16 @@ backoff. Left empty, the retry attempt is itself the probe.
 
 Classification is a **conservative allowlist** (`ECONNRESET`, `ENOTFOUND`,
 `EAI_AGAIN`, `socket hang up`, `fetch failed`, `429`, `502/503/504`, `overloaded`,
-`rate limit`, …). Anything unmatched is treated as a real failure, because
-retrying a real failure wastes an hour and hides a bug. Bare `timeout` is
+`rate limit`, `stream ended without a stop reason`, …). Anything unmatched is treated as a real
+failure, because retrying a real failure wastes an hour and hides a bug. Bare `timeout` is
 deliberately **not** a signature — our own wall-clock expiry is a budget problem
 that needs human eyes, not another 90-minute attempt.
+
+The cost of a signature that is one word short is the whole item, not a slower retry.
+`stream (?:error|interrupted|closed)` did not match `Bedrock stream ended without a stop
+reason`, so a transport fault was filed as a real failure and **blocked an implementer that had
+already written three complete files** and was starting the fourth — work `resumeOnRetry` would
+have revived intact. A miss here does not degrade gracefully; add the phrasing when you see one.
 
 `fallbackModels` is empty on all three agents on purpose: switching models during
 an outage is pure waste and disguises one outage as "several models failed for
@@ -402,6 +447,30 @@ stays unconfigured, and these two mechanical facts bound anyone revisiting it:
   the first already wrote. RPC `resume` takes `{ id, message }` and reads the model
   from the persisted descriptor, so a model switch here means a **fresh** child over a
   half-edited tree — losing the work preservation this layer exists for.
+
+## A child that never started is reported in seconds, not in hours
+
+The completion event is best-effort. A workflow that dies at launch — `Unknown agent:
+fr-implementer`, measured at **37 ms** from `startedAt` to `endedAt` — writes no result for
+pi-subagents' result watcher to publish, so `subagent:async-complete` never fires. The driver was
+then waiting on a promise nobody would settle: the item read `implementing` for 51 minutes and
+would have read it until `childTimeoutMs` (3 h) expired into a second, equally uninformative
+WALLCLOCK error. The run's own state said `failed` the entire time.
+
+So `rpc.ts` no longer trusts the event alone:
+
+- **Events that arrive before the launch RPC replies are buffered, not dropped.** Subscribing
+  early was already the intent; `if (!asyncId) return` threw away exactly the events that
+  subscription existed to catch.
+- **The run's state is polled** (`status` RPC, every 15 s) and, once terminal, settles the child:
+  after 20 s for `failed` / `stopped` / `rejected`, after 120 s for `complete` — longer there
+  because the event is the normal path and carries the child's `structuredOutput`, which a
+  synthesised outcome cannot.
+- **Every child's non-success status now blocks its own phase**, and the message carries the
+  child's `error`, not just its `summary` — which for a workflow that never started is the empty
+  string. `Implementer ended with status "failed". Summary:` used to be the whole report. An
+  `Unknown agent` in there also prints what to do about it, because that is an install problem
+  and its fix is not a diagnosis.
 
 ## A PLAN with no test matrix is refused before anything runs
 
@@ -456,10 +525,15 @@ report itself.
 | `paused` (network) | network unreachable after the retries | holds this item's work | not started |
 | `paused` (decision) | a child asked a question only you can answer | holds this item's work | not started |
 | `paused` (stopped) | you hard-stopped the driver mid-child; that child was abandoned, not killed | holds this item's work, plus whatever the abandoned child was mid-way through writing | not started |
-| `blocked` | PLAN missing / has no test matrix (nothing ran); verify still red; audit still finds in-contract gaps after `maxFixRounds`; or the audit is **not converging** (an adjudicated id was re-raised, or the gap count did not fall) | holds this item's work | not started |
+| `blocked` | PLAN missing / has no test matrix (nothing ran); a child that could not run at all (bad install, dead workflow); verify still red; audit still finds in-contract gaps after `maxFixRounds`; or the audit is **not converging** (an adjudicated id was re-raised, or the gap count did not fall) | holds this item's work | not started |
 
 `blocked` and `paused` both stop the batch — later items depend on the earlier one
 landing. Neither commits anything.
+
+**`blocked` is sticky, and `run` does not retry it.** The next run sees the recorded note and
+re-reports it. That is deliberate: the item's phase and its frozen contract are still on disk and
+the driver cannot tell which of them your fix invalidated. Clear it yourself — `reset` to
+re-implement from scratch against a re-frozen contract, or `remove` to drop it.
 
 A non-convergence block is not a budget timeout: it means the loop cannot terminate on its
 own. Read `<id>.gaps.json` — either the fixer's closing test really is vacuous (fix it by
@@ -473,20 +547,25 @@ not by scrolling.
 
 | file | lines | what |
 |---|---|---|
-| `index.ts` | 264 | `registerTool` + `registerCommand` + `session_shutdown`. The architecture note at the top is the map. |
-| `driver.ts` | 754 | `runBatch` — the item loop: gate, freeze, implement, verify, audit, fix rounds, commit. |
-| `resilience.ts` | 420 | transient-failure signatures, backoff, connectivity probe, the child's supervisor-ask channel, `NetworkPause`. |
-| `contract.ts` | 279 | the frozen audit contract, the gap ledger, out-of-scope recording, verdict parsing. |
-| `rpc.ts` | 274 | pi-subagents' in-process RPC: spawn a child, resolve on completion. |
-| `types.ts` | 271 | every interface, both JSON schemas, the shared constants. No logic. |
-| `queue_ops.ts` | 265 | `add` / `remove` / `reset` / `archive` — the only writers of `queue.json`. |
-| `store.ts` | 261 | on-disk state: queue, progress, history, run lock, artifact pruning. |
-| `render.ts` | 248 | `status` (summary / all / one item) and `history` rendering. |
+| `index.ts` | 262 | `registerTool` + `registerCommand` + `session_shutdown`. The architecture note at the top is the map. |
+| `driver.ts` | 858 | `runBatch` — the item loop: gate, freeze, implement, verify, audit, fix rounds, commit. |
+| `resilience.ts` | 513 | transient-failure signatures, backoff, connectivity probe, the child's supervisor-ask channel, `NetworkPause`. |
+| `rpc.ts` | 375 | pi-subagents' in-process RPC: launch a child, settle on its completion event **or on its run state**. |
+| `types.ts` | 320 | every interface, both JSON schemas, the shared constants. No logic. |
+| `store.ts` | 314 | on-disk state: queue (+ budget defaults/validation), progress, history, run lock, artifact pruning. |
+| `render.ts` | 298 | `status` (summary / all / one item) and `history` rendering. |
+| `contract.ts` | 301 | the frozen audit contract, the gap ledger, out-of-scope recording, verdict parsing. |
+| `queue_ops.ts` | 292 | `add` / `remove` / `reset` / `archive` — the only writers of `queue.json`. |
 | `background.ts` | 188 | start / stop / finish the background driver, and how it reports back. |
-| `prompts.ts` | 144 | the three agents' task text. Prose, not logic. |
+| `prompts.ts` | 144 | the three agents' per-item task text. Prose, not logic. |
 | `config.ts` | 128 | the model + reasoning-effort layer stack. |
 | `state.ts` | 70 | live-driver registry and its formatters. The only shared mutable state. |
 | `paths.ts` | 30 | every path under `.pi/fr-batch/`, plus `writeAtomic`. |
+| `agents/*.md` | 210 | the three agent DEFINITIONS — who each child is, and the two escalation protocols the driver implements. Shipped, not assumed. |
+
+The split between `agents/*.md` and `prompts.ts` is the standing/per-item split: the definition
+is the child's identity and its protocol obligations (never commit, `NETWORK_DOWN:`,
+`need_decision`), the prompt is this item's PLAN and gap list.
 
 Three invariants hold the split together, all pinned by `tests/probe_modules.ts`:
 
@@ -504,23 +583,60 @@ Three invariants hold the split together, all pinned by `tests/probe_modules.ts`
 
 ```bash
 node tests/typecheck.mjs   # link .types/ + typecheck (include: ["*.ts"])
-node tests/run.mjs         # guard tests
+node tests/run.mjs         # guard tests (~70s)
+node tests/mutation.mjs    # prove each fix's guard goes RED when the fix is reverted (~1min)
 ```
+
+`tests/mutation.mjs` is the answer to this suite's worst moment: 195 assertions stayed green with
+all three agent definitions deleted. It reverts each fix in source, runs the probe that is supposed
+to catch it, and fails if the probe stays green — so "verified RED when reverted" is a command
+anyone can re-run instead of a claim in a commit message. It restores every file and re-runs the
+whole suite before it exits. 16 mutations, all currently caught.
 
 A `pi install git:` copy lives at `~/.pi/agent/git/github.com/AllenDang/fr-batch`, and
 `pi update` **resets and cleans** that clone — so edit your own checkout and point pi at it
 with a local-path package (`pi install /path/to/fr-batch`) rather than editing in place.
 
-`tests/run.mjs` runs six probe files against the real modules and throwaway git repos — 195
+`tests/run.mjs` runs eight probe files against the real modules and throwaway git repos — 318
 assertions. It covers the supervisor-ask classification and reply file, the detach marker, the
 tests-section matcher, the pre-flight gate, `runBatch`'s decision-pause refusal, the
 model/effort layer stack (both in isolation and end-to-end into the spawn params of every
 role), the background driver's whole lifecycle (immediate return, mid-run `add`, graceful vs
 hard `stop`, the resumable stopped pause, one-notification-per-run, the run-lock heartbeat),
-the module invariants above, and the scale contract: that `status` renders the same number of
-lines for a 342-item queue as for a 31-item one while never folding an actionable row, and
-that an `archive` sweep moves the record to `history.jsonl` without losing a note, a contract
-file, or a refusal. Each fix it covers was verified to turn it RED when reverted.
+the module invariants above, the install surface (below), and the scale contract: that `status`
+renders the same number of lines for a 342-item queue as for a 31-item one while never folding
+an actionable row, and that an `archive` sweep moves the record to `history.jsonl` without
+losing a note, a contract file, or a refusal. Each fix it covers was verified to turn it RED
+when reverted.
+
+`tests/probe_install.ts` is the newest file and it exists because of a specific hole: the suite
+asserted that the spawn param `agent` equals the string `"fr-implementer"` and never that
+anything answers to that name, so deleting all three agent definitions changed no assertion
+while making a fresh install fail on its first child. It now derives the agent list by grepping
+`driver.ts`, so a fourth agent cannot be added without either shipping its definition or turning
+this red, and it checks the definitions carry what the driver's contract needs
+(`inheritProjectContext`, `contact_supervisor`, both escalation protocols, write tools for the
+two writers and none for the auditor). It also pins the budget defaults and refusals, that a
+completion event arriving inside the launch round-trip still settles the child, and that a
+block message states the child's `error` rather than its empty `summary`.
+
+The same vacuity had a **second instance**, and it hid a dead feature: `probe_channel.ts` wrote its
+supervisor-ask fixture *into* `SUPERVISOR_CHANNEL_ROOT` and read it back, which holds for any value
+that constant can have. It held `<tmpdir>/pi-subagents/supervisor-channels`, a directory nothing
+creates — pi-subagents' root is `PI_SUBAGENTS_TEMP_ROOT` or `<tmpdir>/pi-subagents-<uid-scope>` —
+so `findPendingAsks` returned `[]` in production forever: no `NETWORK_DOWN:` report was ever held
+through an outage and no decision ask was ever answered, which is exactly why every such child
+ended up "Detached for intercom coordination" instead. `probe_install.ts` now pins the roots
+against pi-subagents' own rule, spelled out from upstream rather than imported, so a wrong root
+cannot satisfy its own test.
+
+`tests/probe_audit2.ts` covers the second audit wave: token-bounded gap-id scoping (a bare
+`includes` let `T1` match a contract containing `T10`, and an out-of-contract gap that passes the
+scope gate blocks the item), that an unparseable verdict re-runs the auditor **only** and not the
+whole verify gate, `reset`'s live-driver refusal, that a status-less progress patch keeps a pause's
+revival fields, that an expired supervisor request is not reported as a live question, and that
+artifact pruning keeps the audit verdict rather than a fixer report whose filename also ends in
+`-audit-<N>.json`.
 
 The probes `import { runBatch } from "../driver.ts"` directly. They used to run against a
 regenerated *copy* of a single 3.5k-line `index.ts` with three fragments rewritten to make it
