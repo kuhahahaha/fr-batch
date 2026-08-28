@@ -384,5 +384,29 @@ ok("the signature list is a list of regexes", TRANSIENT_SIGNATURES.every((r) => 
   ok("...and every exit path released the run lock", !existsSync(join(dirOnly, ".pi/fr-batch/.run.lock")));
 }
 
+// ---------------------------------------------------------------------------
+// tsconfig.json must be accepted by a CURRENT tsc, not only by the one on this machine
+//
+// A local `node_modules/typescript` is gitignored, so a long-lived checkout can sit on an old
+// tsc while every fresh clone gets the current one. Measured: the committed config typechecked
+// clean under 5.9.3 and failed under 7.0.2 with three TS5090s (`paths` values not starting with
+// `./`) plus TS5102 (`baseUrl` removed in TS7) — so `node tests/typecheck.mjs`, the gate this
+// repo documents, was red on any current machine for reasons that had nothing to do with the
+// code. Same shape as the `/opt/homebrew` paths PR #1 removed: one machine's toolchain baked
+// into a committed file.
+// ---------------------------------------------------------------------------
+{
+  const raw = readFileSync(join(root, "tsconfig.json"), "utf8");
+  const cfg = JSON.parse(raw) as { compilerOptions?: Record<string, unknown> };
+  const co = cfg.compilerOptions ?? {};
+  ok("tsconfig sets no baseUrl (removed in TS7; `paths` alone resolves against the config)", !("baseUrl" in co), JSON.stringify(co.baseUrl));
+  const pathValues = Object.values((co.paths ?? {}) as Record<string, string[]>).flat();
+  const rootDirs = ((co.typeRoots ?? []) as string[]);
+  ok("every paths target is relative (`./…`), which TS7 requires", pathValues.length > 0 && pathValues.every((p) => p.startsWith("./")), pathValues.join(" "));
+  ok("...and every typeRoots entry too", rootDirs.every((p) => p.startsWith("./")), rootDirs.join(" "));
+  // The link farm those paths point INTO is built by tests/typecheck.mjs, so the two must agree.
+  ok("...and they point at the .types/ farm typecheck.mjs builds", pathValues.every((p) => p.startsWith("./.types/")), pathValues.join(" "));
+}
+
 console.log(fails === 0 ? "\nprobe_install: all pass" : `\nprobe_install: ${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);

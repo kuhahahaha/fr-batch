@@ -8,12 +8,11 @@
     "module": "esnext",
     "moduleResolution": "bundler",
     "lib": ["es2023", "dom"],
-    "typeRoots": [".types/@types"], "types": ["node"],
-    "baseUrl": ".",
+    "typeRoots": ["./.types/@types"], "types": ["node"],
     "paths": {
-      "@earendil-works/pi-coding-agent": [".types/pi-coding-agent/dist/index.d.ts"],
-      "@earendil-works/pi-ai": [".types/pi-ai/dist/index.d.ts"],
-      "typebox": [".types/typebox/build/index.d.mts"]
+      "@earendil-works/pi-coding-agent": ["./.types/pi-coding-agent/dist/index.d.ts"],
+      "@earendil-works/pi-ai": ["./.types/pi-ai/dist/index.d.ts"],
+      "typebox": ["./.types/typebox/build/index.d.mts"]
     }
   },
   "include": ["*.ts"]

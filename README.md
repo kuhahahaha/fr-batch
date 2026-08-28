@@ -582,7 +582,7 @@ Three invariants hold the split together, all pinned by `tests/probe_modules.ts`
 ## After editing
 
 ```bash
-node tests/typecheck.mjs   # link .types/ + typecheck (include: ["*.ts"])
+node tests/typecheck.mjs   # link .types/ + typecheck (prints the tsc version it used)
 node tests/run.mjs         # guard tests (~70s)
 node tests/mutation.mjs    # prove each fix's guard goes RED when the fix is reverted (~1min)
 ```
@@ -597,7 +597,7 @@ A `pi install git:` copy lives at `~/.pi/agent/git/github.com/AllenDang/fr-batch
 `pi update` **resets and cleans** that clone — so edit your own checkout and point pi at it
 with a local-path package (`pi install /path/to/fr-batch`) rather than editing in place.
 
-`tests/run.mjs` runs eight probe files against the real modules and throwaway git repos — 318
+`tests/run.mjs` runs eight probe files against the real modules and throwaway git repos — 323
 assertions. It covers the supervisor-ask classification and reply file, the detach marker, the
 tests-section matcher, the pre-flight gate, `runBatch`'s decision-pause refusal, the
 model/effort layer stack (both in isolation and end-to-end into the spawn params of every
@@ -655,3 +655,11 @@ installation out of several — under nvm the directory does not exist, and both
 editor then reported every pi import as unresolved. `--link-only` refreshes the links without
 typechecking, which is all an LSP needs. `allowImportingTsExtensions` is on because pi
 resolves `./x.ts` specifiers as written.
+
+That class of defect recurred once more and is worth knowing about: a local
+`node_modules/typescript` is gitignored, so a long-lived checkout can sit on an old tsc while
+every fresh clone gets the current one. Measured on a fresh clone of this repo: `typecheck:
+clean` under 5.9.3, and under 7.0.2 three `TS5090`s (a `paths` value must start with `./`) plus
+`TS5102` (`baseUrl` was removed). The config is now valid under both, `typecheck.mjs` prints the
+version it used so a green run is attributable, and `probe_install.ts` fails if either spelling
+comes back.

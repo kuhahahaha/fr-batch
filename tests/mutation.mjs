@@ -128,6 +128,18 @@ const MUTATIONS = [
         "  const roundOf = (f: string): number => Number(f.match(/-audit-(\\d+)\\.json$/)?.[1] ?? -1);",
       ),
   },
+  {
+    name: "tsconfig reintroduces baseUrl (removed in TS7)",
+    probe: "probe_install.ts",
+    file: "tsconfig.json",
+    mutate: (t) => t.replace('    "typeRoots"', '    "baseUrl": ".",\n    "typeRoots"'),
+  },
+  {
+    name: "tsconfig paths go back to non-relative (TS5090 on a current tsc)",
+    probe: "probe_install.ts",
+    file: "tsconfig.json",
+    mutate: (t) => t.replaceAll('["./.types/', '[".types/'),
+  },
 ];
 
 let bad = 0;

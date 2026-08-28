@@ -100,8 +100,14 @@ if (!tsc) {
   process.exit(2);
 }
 try {
+  // The VERSION is printed, because "typecheck: clean" is not attributable without it. A local
+  // node_modules/typescript is gitignored, so one checkout can be pinned to an old tsc while a
+  // fresh clone picks up the current one — and this repo's committed tsconfig was accepted by
+  // 5.9.3 and REJECTED by 7.0.2 (TS5090 on non-relative `paths`, TS5102 on `baseUrl`), which is
+  // invisible if the version is not on screen.
+  const version = execFileSync(tsc.cmd, [...tsc.args, "--version"], { encoding: "utf8" }).trim();
   execFileSync(tsc.cmd, [...tsc.args, "-p", join(repo, "tsconfig.json")], { stdio: "inherit" });
-  console.log("typecheck: clean");
+  console.log(`typecheck: clean (${version})`);
 } catch {
   process.exit(1);
 }
